@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'master'
+      - 'fork-build'
     paths-ignore:
       - '**.md'
 
