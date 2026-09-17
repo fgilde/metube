@@ -98,8 +98,11 @@ Enabling `writeinfojson` or `writethumbnail` in `YTDL_OPTIONS` also writes a fee
 * __HTTPS__: Use `https` instead of `http` (__CERTFILE__ and __KEYFILE__ required). Defaults to `false`.
 * __CERTFILE__: HTTPS certificate file path.
 * __KEYFILE__: HTTPS key file path.
-* __CORS_ALLOWED_ORIGINS__: Comma-separated list of origins permitted to make cross-origin requests to the MeTube API; `*` allows all. When unset or empty, all cross-origin requests are denied. Required for browser extensions and bookmarklets — see [Sending links to MeTube](#-sending-links-to-metube). Naming origins explicitly also lets them send credentials (a login cookie, or the `Authorization` header a reverse proxy checks), which `*` deliberately does not: it would let any site you visit drive your instance with your own session.
+* __CORS_ALLOWED_ORIGINS__: Comma-separated list of origins permitted to make cross-origin requests to the MeTube API; `*` allows all. When unset or empty, all cross-origin requests are denied. Required for browser extensions and bookmarklets — see [Sending links to MeTube](#-sending-links-to-metube). Named origins may also send credentials (a login cookie or `Authorization` header); `*` deliberately may not, since any site you visit could otherwise drive your instance.
 * __ROBOTS_TXT__: A path to a `robots.txt` file mounted in the container.
+* __BASIC_AUTH_USERNAME__ / __BASIC_AUTH_PASSWORD__: Set both to put UI and API behind HTTP Basic auth.
+* __DIRECT_ROUTES__: Enables `/watch?v=<id>` and `/dl/<name>.<mp4|mp3|jpg>`, which stream one item back without saving it ([docs](docs/direct-routes.md)). Default `false`.
+* __DIRECT_ROUTES_KEY__: If set, direct routes need `?key=<value>` (or `X-Api-Key` header) and skip Basic auth, so links work without the UI password.
 
 ## 🎛️ Configuring yt-dlp options
 
@@ -248,8 +251,6 @@ __Bookmarklets__ send the currently open page to MeTube with one click. Add the 
 __iOS Shortcut:__ [rithask](https://github.com/rithask) created an [iOS shortcut](https://www.icloud.com/shortcuts/66627a9f334c467baabdb2769763a1a6) for sending URLs to MeTube from Safari's share menu; it prompts for your instance address on first use.
 
 __Raycast:__ [dotvhs](https://github.com/dotvhs) has created an [extension for Raycast](https://www.raycast.com/dot/metube) for adding videos to MeTube directly from Raycast.
-
-__Direct streaming:__ `/watch?v=<id>` plays a video as mp4 without saving it; `/dl/<name>.<mp4|mp3|jpg>` searches for `<name>` (or fetches `?url=`) and streams the top hit. Add `&download=1` to save instead, `&ts=42` for a video frame as jpg.
 
 ## 🎵 Pairing with a music tagger
 

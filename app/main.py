@@ -10,6 +10,9 @@ from aiohttp import web
 from aiohttp.web import GracefulExit
 from aiohttp.log import access_logger
 import ssl
+import base64
+import binascii
+import hmac
 import socket
 import socketio
 import logging
@@ -101,9 +104,13 @@ class Config:
         'LOGLEVEL': 'INFO',
         'ENABLE_ACCESSLOG': 'false',
         'YTDL_NIGHTLY_UPDATE_TIME': '',
+        'BASIC_AUTH_USERNAME': '',
+        'BASIC_AUTH_PASSWORD': '',
+        'DIRECT_ROUTES': 'false',
+        'DIRECT_ROUTES_KEY': '',
     }
 
-    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'DELETE_FILE_ON_TRASHCAN', 'HTTPS', 'ENABLE_ACCESSLOG', 'ALLOW_YTDL_OPTIONS_OVERRIDES', 'ALLOW_PRIVATE_ADDRESSES')
+    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'DELETE_FILE_ON_TRASHCAN', 'HTTPS', 'ENABLE_ACCESSLOG', 'ALLOW_YTDL_OPTIONS_OVERRIDES', 'ALLOW_PRIVATE_ADDRESSES', 'DIRECT_ROUTES')
 
     def __init__(self):
         for k, v in self._DEFAULTS.items():
@@ -132,6 +139,11 @@ class Config:
 
         if not self.URL_PREFIX.endswith('/'):
             self.URL_PREFIX += '/'
+
+        # Half-configured Basic auth would accept an empty password.
+        if bool(self.BASIC_AUTH_USERNAME) != bool(self.BASIC_AUTH_PASSWORD):
+            log.error('BASIC_AUTH_USERNAME and BASIC_AUTH_PASSWORD must be set together')
+            sys.exit(1)
 
         # Strip trailing slashes from the download directories. get_custom_dirs()
         # builds the folder dropdown by removing the base path as a prefix from
@@ -361,7 +373,37 @@ async def state_dir_guard(request, handler):
     return await handler(request)
 
 
-app = web.Application(middlewares=[state_dir_guard])
+def _is_direct_route(path: str) -> bool:
+    return path == config.URL_PREFIX + 'watch' or path.startswith(config.URL_PREFIX + 'dl/')
+
+
+def _basic_auth_ok(request) -> bool:
+    scheme, _, token = request.headers.get('Authorization', '').partition(' ')
+    if scheme.lower() != 'basic':
+        return False
+    try:
+        login, _, password = base64.b64decode(token.strip(), validate=True).decode('utf-8').partition(':')
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+    # '&' rather than 'and' so both comparisons always run.
+    return (hmac.compare_digest(login.encode(), config.BASIC_AUTH_USERNAME.encode())
+            & hmac.compare_digest(password.encode(), config.BASIC_AUTH_PASSWORD.encode()))
+
+
+@web.middleware
+async def auth_guard(request, handler):
+    # Basic auth covers the whole app (UI, API, socket.io) once configured.
+    # CORS preflights carry no credentials by design and pass. Direct routes
+    # that have their own key are exempt: the key is their credential, so a
+    # /dl/... link can be handed to someone without the UI password.
+    if (config.BASIC_AUTH_USERNAME and request.method != 'OPTIONS'
+            and not (config.DIRECT_ROUTES_KEY and _is_direct_route(request.path))
+            and not _basic_auth_ok(request)):
+        raise web.HTTPUnauthorized(headers={'WWW-Authenticate': 'Basic realm="MeTube"'})
+    return await handler(request)
+
+
+app = web.Application(middlewares=[auth_guard, state_dir_guard])
 _cors_origins = [o.strip() for o in config.CORS_ALLOWED_ORIGINS.split(',') if o.strip()] if config.CORS_ALLOWED_ORIGINS else []
 if '*' in _cors_origins and len(_cors_origins) > 1:
     log.warning(
@@ -1297,7 +1339,8 @@ async def robots(request):
         response = web.FileResponse(os.path.join(config.BASE_DIR, config.ROBOTS_TXT))
     else:
         response = web.Response(
-            text="User-agent: *\nDisallow: /download/\nDisallow: /audio_download/\nDisallow: /dl/\nDisallow: /watch\n"
+            text="User-agent: *\nDisallow: /download/\nDisallow: /audio_download/\n"
+            + ("Disallow: /dl/\nDisallow: /watch\n" if config.DIRECT_ROUTES else "")
         )
     return response
 
@@ -1327,6 +1370,10 @@ async def _run_direct_fetch(*args):
 
 
 async def _direct_serve(request, source: str, ext: str):
+    if config.DIRECT_ROUTES_KEY:
+        key = request.query.get('key') or request.headers.get('X-Api-Key') or ''
+        if not hmac.compare_digest(key.encode(), config.DIRECT_ROUTES_KEY.encode()):
+            raise web.HTTPForbidden(text='missing or wrong key')
     loop = asyncio.get_running_loop()
     err = await loop.run_in_executor(None, partial(validate_url, source, allow_private=config.ALLOW_PRIVATE_ADDRESSES))
     if err is not None:
@@ -1349,7 +1396,6 @@ async def _direct_serve(request, source: str, ext: str):
         path, tmp, headers={'Content-Disposition': direct.content_disposition(title, ext, download)})
 
 
-@routes.get(config.URL_PREFIX + 'watch')
 async def watch(request):
     """``/watch?v=<id-or-url>[&download=1]`` — the video as mp4, like YouTube's own path."""
     source = (request.query.get('v') or '').strip()
@@ -1358,12 +1404,18 @@ async def watch(request):
     return await _direct_serve(request, source, 'mp4')
 
 
-@routes.get(config.URL_PREFIX + 'dl/{name}')
 async def dl(request):
     """``/dl/<name>.<mp4|mp3|jpg>[?url=...][&download=1][&ts=90]`` — search by name, or fetch ``url``."""
     term, ext = direct.parse_name(request.match_info['name'])
     source = (request.query.get('url') or '').strip() or f'ytsearch1:{term}'
     return await _direct_serve(request, source, ext)
+
+
+# Opt-in: an anonymous fetch that leaves no queue row is a different exposure
+# than the queue, so the routes do not exist at all unless DIRECT_ROUTES is set.
+if config.DIRECT_ROUTES:
+    routes.get(config.URL_PREFIX + 'watch')(watch)
+    routes.get(config.URL_PREFIX + 'dl/{name}')(dl)
 
 if config.URL_PREFIX != '/':
     @routes.get('/')
