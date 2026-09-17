@@ -101,7 +101,7 @@ Enabling `writeinfojson` or `writethumbnail` in `YTDL_OPTIONS` also writes a fee
 * __CORS_ALLOWED_ORIGINS__: Comma-separated list of origins permitted to make cross-origin requests to the MeTube API; `*` allows all. When unset or empty, all cross-origin requests are denied. Required for browser extensions and bookmarklets — see [Sending links to MeTube](#-sending-links-to-metube). Named origins may also send credentials (a login cookie or `Authorization` header); `*` deliberately may not, since any site you visit could otherwise drive your instance.
 * __ROBOTS_TXT__: A path to a `robots.txt` file mounted in the container.
 * __BASIC_AUTH_USERNAME__ / __BASIC_AUTH_PASSWORD__: Set both to put UI and API behind HTTP Basic auth.
-* __DIRECT_ROUTES__: Enables `/watch?v=<id>` and `/dl/<name>.<mp4|mp3|jpg>`, which stream one item back without saving it ([docs](docs/direct-routes.md)). Default `false`.
+* __DIRECT_ROUTES__: Enables `/watch?v=<id>` and `/dl/<name>.<mp4|mp3|jpg>`, which stream one item back without saving it ([docs](docs/direct-routes.md)). Default `true`.
 * __DIRECT_ROUTES_KEY__: If set, direct routes need `?key=<value>` (or `X-Api-Key` header) and skip Basic auth, so links work without the UI password.
 
 ## 🎛️ Configuring yt-dlp options

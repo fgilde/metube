@@ -15,14 +15,25 @@ file back, and delete the directory once the response body has been sent. Nothin
 
 ## Settings
 
-The routes are off by default. Everything is configured through environment variables, like the
-rest of MeTube.
-
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `DIRECT_ROUTES` | `false` | Registers `/watch` and `/dl/…`. When `false` the routes do not exist (404) and `robots.txt` does not mention them. |
+| `DIRECT_ROUTES` | `true` | Enables `/watch` and `/dl/…`. When `false` the routes answer `404` and `robots.txt` does not mention them. |
 | `DIRECT_ROUTES_KEY` | empty | When set, every direct request must carry the key as `?key=<value>` or an `X-Api-Key` header; otherwise `403`. Requests carrying the key are exempt from Basic auth (see below). |
-| `BASIC_AUTH_USERNAME` / `BASIC_AUTH_PASSWORD` | empty | Set both to put the whole instance (UI, REST API, socket.io, file server) behind HTTP Basic auth. Setting only one is a startup error. |
+| `BASIC_AUTH_USERNAME` / `BASIC_AUTH_PASSWORD` | empty | Set both to put the whole instance (UI, REST API, socket.io, file server) behind HTTP Basic auth. Setting only one is a startup error. Environment only. |
+
+`DIRECT_ROUTES` and `DIRECT_ROUTES_KEY` can also be changed at runtime from the UI: the gear
+icon in the navbar opens a settings dialog with the toggle, the key field and a *Generate*
+button. Changes apply immediately (no restart) and persist in `STATE_DIR/settings.json`.
+Precedence, highest first:
+
+1. an environment variable that is explicitly set — it wins and the field is shown locked in
+   the UI;
+2. the value last saved from the UI;
+3. the default.
+
+The same values are available over HTTP as `GET /settings` and `POST /settings`
+(JSON body with `direct_routes` and/or `direct_routes_key`; a locked field is refused with
+`400`). Both endpoints sit behind Basic auth like the rest of the API.
 
 How the two credentials combine:
 
@@ -139,9 +150,9 @@ per-download overrides are not exposed on these routes.
 
 ## Security
 
-* Off by default, and meant to be run with `DIRECT_ROUTES_KEY` (or Basic auth, or a reverse
-  proxy that authenticates) on any instance reachable from the internet: an anonymous fetch
-  that leaves no queue row is a different exposure than the queue.
+* On by default. On any instance reachable from the internet, set `DIRECT_ROUTES_KEY` (or
+  Basic auth, or a reverse proxy that authenticates), or switch the routes off: an anonymous
+  fetch that leaves no queue row is a different exposure than the queue.
 * `validate_url` runs on the submitted `v`/`url` before anything is spawned, and
   `install_socket_guard` runs inside the worker process, so redirects and manifest-derived
   media URLs are re-checked at connect time — the same two layers a queue download gets.
@@ -161,5 +172,5 @@ per-download overrides are not exposed on these routes.
 Proposed upstream as alexta69/metube#1078 and declined: the maintainer considers a
 stream-and-forget route a second product outside MeTube's contract, and objected to the
 routes arriving switched on without authentication and to file names being turned into
-searches. This fork keeps the feature, with the opt-in flag, the key and Basic auth added
-in response to the first point.
+searches. This fork keeps the feature, with the toggle, the key and Basic auth added in
+response to the first point.

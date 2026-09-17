@@ -66,6 +66,14 @@ class DownloadsServiceStub {
   deleteCookies() {
     return of({ status: 'ok' });
   }
+
+  getSettings() {
+    return of({ direct_routes: true, direct_routes_key: '', locked: { direct_routes: false, direct_routes_key: false } });
+  }
+
+  saveSettings() {
+    return of({ direct_routes: true, direct_routes_key: '', locked: { direct_routes: false, direct_routes_key: false } });
+  }
 }
 
 class SubscriptionsServiceStub {

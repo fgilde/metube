@@ -28,6 +28,7 @@ from watchfiles import DefaultFilter, Change, awatch
 
 import bg_tasks
 import direct
+from state_store import AtomicJsonStore
 from url_guard import validate_url
 from ytdl import DownloadQueueNotifier, DownloadQueue, Download, _MP_CTX
 from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, coerce_optional_bool
@@ -106,7 +107,7 @@ class Config:
         'YTDL_NIGHTLY_UPDATE_TIME': '',
         'BASIC_AUTH_USERNAME': '',
         'BASIC_AUTH_PASSWORD': '',
-        'DIRECT_ROUTES': 'false',
+        'DIRECT_ROUTES': 'true',
         'DIRECT_ROUTES_KEY': '',
     }
 
@@ -349,6 +350,31 @@ class ObjectSerializer(json.JSONEncoder):
 serializer = ObjectSerializer()
 
 _STATE_DIR_REAL = os.path.realpath(config.STATE_DIR)
+
+# Settings that can also be changed at runtime from the UI. An environment
+# variable that is explicitly set wins and locks the field in the UI; otherwise
+# the last value saved from the UI applies, then the default.
+_SETTING_TYPES = {'DIRECT_ROUTES': bool, 'DIRECT_ROUTES_KEY': str}
+_settings_store = AtomicJsonStore(os.path.join(config.STATE_DIR, 'settings.json'), kind='settings')
+_settings_locked = {k: k in os.environ for k in _SETTING_TYPES}
+
+
+def _apply_saved_settings():
+    saved = _settings_store.load() or {}
+    for key, typ in _SETTING_TYPES.items():
+        if isinstance(saved.get(key), typ) and not _settings_locked[key]:
+            setattr(config, key, saved[key])
+
+
+def _settings_payload() -> dict:
+    return {
+        'direct_routes': bool(config.DIRECT_ROUTES),
+        'direct_routes_key': config.DIRECT_ROUTES_KEY,
+        'locked': {k.lower(): v for k, v in _settings_locked.items()},
+    }
+
+
+_apply_saved_settings()
 
 
 def _is_within_state_dir(real_target: str) -> bool:
@@ -1369,6 +1395,13 @@ async def _run_direct_fetch(*args):
         pool.shutdown(wait=False)
 
 
+def _direct_enabled_or_404():
+    # Checked per request rather than at route registration so the UI toggle
+    # takes effect without a restart.
+    if not config.DIRECT_ROUTES:
+        raise web.HTTPNotFound()
+
+
 async def _direct_serve(request, source: str, ext: str):
     if config.DIRECT_ROUTES_KEY:
         key = request.query.get('key') or request.headers.get('X-Api-Key') or ''
@@ -1396,26 +1429,51 @@ async def _direct_serve(request, source: str, ext: str):
         path, tmp, headers={'Content-Disposition': direct.content_disposition(title, ext, download)})
 
 
+@routes.get(config.URL_PREFIX + 'watch')
 async def watch(request):
     """``/watch?v=<id-or-url>[&download=1]`` — the video as mp4, like YouTube's own path."""
+    _direct_enabled_or_404()
     source = (request.query.get('v') or '').strip()
     if not source:
         raise web.HTTPBadRequest(reason="missing 'v'")
     return await _direct_serve(request, source, 'mp4')
 
 
+@routes.get(config.URL_PREFIX + 'dl/{name}')
 async def dl(request):
     """``/dl/<name>.<mp4|mp3|jpg>[?url=...][&download=1][&ts=90]`` — search by name, or fetch ``url``."""
+    _direct_enabled_or_404()
     term, ext = direct.parse_name(request.match_info['name'])
     source = (request.query.get('url') or '').strip() or f'ytsearch1:{term}'
     return await _direct_serve(request, source, ext)
 
 
-# Opt-in: an anonymous fetch that leaves no queue row is a different exposure
-# than the queue, so the routes do not exist at all unless DIRECT_ROUTES is set.
-if config.DIRECT_ROUTES:
-    routes.get(config.URL_PREFIX + 'watch')(watch)
-    routes.get(config.URL_PREFIX + 'dl/{name}')(dl)
+@routes.get(config.URL_PREFIX + 'settings')
+async def settings_get(request):
+    return web.json_response(_settings_payload())
+
+
+@routes.post(config.URL_PREFIX + 'settings')
+async def settings_update(request):
+    post = await _read_json_request(request)
+    changes = {}
+    for key, typ in _SETTING_TYPES.items():
+        field = key.lower()
+        if field not in post:
+            continue
+        value = post[field]
+        if not isinstance(value, typ):
+            raise web.HTTPBadRequest(reason=f'{field} must be a {typ.__name__}')
+        if _settings_locked[key]:
+            raise web.HTTPBadRequest(reason=f'{field} is set by the {key} environment variable and cannot be changed here')
+        changes[key] = value.strip() if typ is str else value
+    for key, value in changes.items():
+        setattr(config, key, value)
+    saved = {k: v for k, v in (_settings_store.load() or {}).items() if k in _SETTING_TYPES}
+    saved.update(changes)
+    await asyncio.get_running_loop().run_in_executor(None, _settings_store.save, saved)
+    log.info('Settings updated from the UI: %s', sorted(changes))
+    return web.json_response(_settings_payload())
 
 if config.URL_PREFIX != '/':
     @routes.get('/')

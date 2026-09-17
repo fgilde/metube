@@ -26,6 +26,15 @@ export interface AddDownloadPayload {
   clipStart?: string;
   clipEnd?: string;
 }
+
+export interface ServerSettings {
+  direct_routes: boolean;
+  direct_routes_key: string;
+  locked: { direct_routes: boolean; direct_routes_key: boolean };
+}
+
+export type ServerSettingsChanges = Partial<Pick<ServerSettings, 'direct_routes' | 'direct_routes_key'>>;
+
 @Injectable({
   providedIn: 'root'
 })
@@ -246,5 +255,13 @@ export class DownloadsService {
     return this.http.get<{ status: string; has_cookies: boolean }>('cookie-status').pipe(
       catchError(this.handleHTTPError)
     );
+  }
+
+  getSettings() {
+    return this.http.get<ServerSettings>('settings').pipe(catchError(this.handleHTTPError));
+  }
+
+  saveSettings(changes: ServerSettingsChanges) {
+    return this.http.post<ServerSettings>('settings', changes).pipe(catchError(this.handleHTTPError));
   }
 }

@@ -49,6 +49,10 @@
     </div>
     -->
     <div class="navbar-nav ms-auto">
+      <button type="button" class="btn btn-link nav-link py-2 px-0 px-sm-2 d-flex align-items-center"
+        aria-label="Settings" ngbTooltip="Settings" (click)="openSettingsModal()">
+        <fa-icon [icon]="faGear" />
+      </button>
       <div class="nav-item dropdown" ngbDropdown placement="bottom-end">
         <button class="btn btn-link nav-link py-2 px-0 px-sm-2 dropdown-toggle d-flex align-items-center"
           id="theme-select"
@@ -678,6 +682,74 @@
           <button type="button" class="btn btn-secondary" (click)="closeBatchImportModal()">Close</button>
           <button type="button" class="btn btn-primary" (click)="startBatchImport()" [disabled]="importInProgress">
             Import URLs
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="modal fade" tabindex="-1" role="dialog"
+  aria-modal="true"
+  aria-labelledby="settings-modal-title"
+  [class.show]="settingsModalOpen"
+  [style.display]="settingsModalOpen ? 'block' : 'none'">
+    <div class="modal-dialog" role="document">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 id="settings-modal-title" class="modal-title">Settings</h5>
+          <button type="button" class="btn-close" aria-label="Close" (click)="closeSettingsModal()"></button>
+        </div>
+        <div class="modal-body">
+          @if (settings) {
+            <div class="form-check form-switch mb-3">
+              <input class="form-check-input" type="checkbox" role="switch" id="settings-direct-routes"
+                [(ngModel)]="settings.direct_routes"
+                [disabled]="settings.locked.direct_routes || settingsSaving">
+              <label class="form-check-label" for="settings-direct-routes">
+                Direct streaming routes (<code>/watch?v=…</code>, <code>/dl/name.mp3</code>)
+              </label>
+              <div class="form-text">
+                @if (settings.locked.direct_routes) {
+                  Set by the <code>DIRECT_ROUTES</code> environment variable.
+                } @else {
+                  Fetch one item and stream it back without saving it. Takes effect immediately.
+                }
+              </div>
+            </div>
+            <label for="settings-direct-routes-key" class="form-label">Access key for direct routes</label>
+            <div class="input-group">
+              <input id="settings-direct-routes-key" type="text" class="form-control" autocomplete="off"
+                placeholder="Empty: no key required"
+                [(ngModel)]="settings.direct_routes_key"
+                [disabled]="settings.locked.direct_routes_key || settingsSaving">
+              <button type="button" class="btn btn-outline-secondary" (click)="generateDirectRoutesKey()"
+                [disabled]="settings.locked.direct_routes_key || settingsSaving">Generate</button>
+            </div>
+            <div class="form-text">
+              @if (settings.locked.direct_routes_key) {
+                Set by the <code>DIRECT_ROUTES_KEY</code> environment variable.
+              } @else {
+                Required as <code>?key=…</code> or an <code>X-Api-Key</code> header. Requests carrying the key skip Basic auth.
+              }
+            </div>
+            <div class="form-text mt-3">
+              Basic auth (<code>BASIC_AUTH_USERNAME</code> / <code>BASIC_AUTH_PASSWORD</code>) is configured through environment variables only.
+            </div>
+          } @else if (!settingsError) {
+            <span class="spinner-border spinner-border-sm" role="status"></span>
+          }
+          @if (settingsError) {
+            <div class="alert alert-danger mt-3 mb-0" role="alert">{{ settingsError }}</div>
+          }
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" (click)="closeSettingsModal()">Cancel</button>
+          <button type="button" class="btn btn-primary" (click)="saveSettings()" [disabled]="!settings || settingsSaving">
+            @if (settingsSaving) {
+              <span class="spinner-border spinner-border-sm me-2" role="status"></span>
+            }
+            Save
           </button>
         </div>
       </div>

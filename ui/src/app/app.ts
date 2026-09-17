@@ -7,10 +7,10 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { FontAwesomeModule } from '@fortawesome/angular-fontawesome';
 import { NgbModule, NgbTypeahead } from '@ng-bootstrap/ng-bootstrap';
 import { NgSelectModule } from '@ng-select/ng-select';
-import { faTrashAlt, faCheckCircle, faTimesCircle, faRedoAlt, faSun, faMoon, faCheck, faCircleHalfStroke, faDownload, faExternalLinkAlt, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faSortAmountDown, faSortAmountUp, faChevronRight, faChevronDown, faUpload, faPause, faPlay, faShareNodes } from '@fortawesome/free-solid-svg-icons';
+import { faTrashAlt, faCheckCircle, faTimesCircle, faRedoAlt, faSun, faMoon, faCheck, faCircleHalfStroke, faDownload, faExternalLinkAlt, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faSortAmountDown, faSortAmountUp, faChevronRight, faChevronDown, faUpload, faPause, faPlay, faShareNodes, faGear } from '@fortawesome/free-solid-svg-icons';
 import { faGithub } from '@fortawesome/free-brands-svg-icons';
 import { CookieService } from 'ngx-cookie-service';
-import { AddDownloadPayload, DownloadsService } from './services/downloads.service';
+import { AddDownloadPayload, DownloadsService, ServerSettings, ServerSettingsChanges } from './services/downloads.service';
 import { MeTubeSocket } from './services/metube-socket.service';
 import { SubscriptionsService } from './services/subscriptions.service';
 import { ToastService } from './services/toast.service';
@@ -112,6 +112,12 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   checkingAllSubscriptions = false;
   checkingSelectedSubscriptions = false;
   hasCookies = false;
+
+  // Server settings modal (runtime-editable settings, see /settings)
+  settingsModalOpen = false;
+  settings: ServerSettings | null = null;
+  settingsSaving = false;
+  settingsError = '';
   cookieUploadInProgress = false;
   themes: Theme[] = Themes;
   activeTheme: Theme | undefined;
@@ -202,6 +208,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   faChevronRight = faChevronRight;
   faChevronDown = faChevronDown;
   faUpload = faUpload;
+  faGear = faGear;
   faPause = faPause;
   faPlay = faPlay;
   faShareNodes = faShareNodes;
@@ -1465,6 +1472,52 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   closeBatchImportModal(): void {
     this.batchImportModalOpen = false;
     this.lastFocusedElement?.focus();
+  }
+
+  openSettingsModal(): void {
+    this.settingsModalOpen = true;
+    this.settings = null;
+    this.settingsError = '';
+    this.downloads.getSettings().subscribe((res) => {
+      if (res && 'direct_routes' in res) {
+        this.settings = res;
+      } else {
+        this.settingsError = `Could not load settings: ${this.formatErrorMessage((res as { msg?: unknown })?.msg)}`;
+      }
+      this.cdr.markForCheck();
+    });
+  }
+
+  closeSettingsModal(): void {
+    this.settingsModalOpen = false;
+  }
+
+  generateDirectRoutesKey(): void {
+    if (!this.settings) return;
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    this.settings.direct_routes_key = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  saveSettings(): void {
+    if (!this.settings) return;
+    // Fields locked by an environment variable are not sent; the server would refuse them.
+    const changes: ServerSettingsChanges = {};
+    if (!this.settings.locked.direct_routes) changes.direct_routes = this.settings.direct_routes;
+    if (!this.settings.locked.direct_routes_key) changes.direct_routes_key = this.settings.direct_routes_key;
+    this.settingsSaving = true;
+    this.settingsError = '';
+    this.downloads.saveSettings(changes).subscribe((res) => {
+      this.settingsSaving = false;
+      if (res && 'direct_routes' in res) {
+        this.settings = res;
+        this.toasts.success('Settings saved.');
+        this.closeSettingsModal();
+      } else {
+        this.settingsError = `Could not save settings: ${this.formatErrorMessage((res as { msg?: unknown })?.msg)}`;
+      }
+      this.cdr.markForCheck();
+    });
   }
 
   // Start importing URLs from the batch modal textarea
