@@ -2,7 +2,11 @@
 # has lagged behind and resolved to a Node patch older than the Angular CLI's
 # minimum supported version, breaking the build. node:22-alpine currently
 # satisfies @angular/cli's >=22.22.3 requirement.
-FROM node:22-alpine AS builder
+#
+# --platform=$BUILDPLATFORM: the frontend bundle is the same for every target
+# architecture, so build it once natively instead of under QEMU, where the
+# arm64 pnpm install is slow and has crashed with "Illegal instruction".
+FROM --platform=$BUILDPLATFORM node:22-alpine AS builder
 
 WORKDIR /metube
 COPY ui ./
