@@ -1,8 +1,7 @@
-# MeTube — the fgilde fork
-
 A self-hosted web UI for [yt-dlp](https://github.com/yt-dlp/yt-dlp): paste a URL, get the
-file. This fork of [alexta69/metube](https://github.com/alexta69/metube) keeps everything
-upstream does and adds the pieces upstream chose not to own:
+file. This [gilde.org](https://www.gilde.org) fork of
+[alexta69/metube](https://github.com/alexta69/metube) keeps everything upstream does and adds
+the pieces upstream chose not to own:
 
 * **Direct links** — `/watch?v=…` and `/dl/<name>.<mp3|mp4|jpg>` fetch one item and stream it
   straight back, without saving anything. Play it, save it, grab the audio, the thumbnail or a
