@@ -39,7 +39,10 @@ RUN sed -i 's/\r$//g' docker-entrypoint.sh && \
     UV_PROJECT_ENVIRONMENT=/usr/local uv sync --frozen --no-dev --compile-bytecode && \
     uv cache clean && \
     rm -f /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/uvw && \
-    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y && \
+    # No "-y": that makes the installer run the freshly downloaded deno for its
+    # shell-profile setup, which crashes under QEMU for the arm64 build. The
+    # binary lands in /usr/local/bin either way, which is all yt-dlp needs.
+    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
     apt-get purge -y --auto-remove build-essential && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir /.cache && chmod 777 /.cache
