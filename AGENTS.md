@@ -130,6 +130,7 @@ app/subscriptions.py — Channel/playlist subscription manager
 app/state_store.py   — JSON-based persistent storage with atomic writes
 app/dl_formats.py    — Video/audio codec/quality mapping
 app/direct.py        — Synchronous /watch and /dl/<name>.<ext> routes (temp-dir fetch, no queue)
+app/auth.py          — Users (scrypt hashes in STATE_DIR/users.json), stateless session tokens
 app/tests/           — pytest tests (asyncio_mode=auto)
 ui/src/app/          — Angular standalone components (no NgModules)
 ```

@@ -7,10 +7,11 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { FontAwesomeModule } from '@fortawesome/angular-fontawesome';
 import { NgbModule, NgbTypeahead } from '@ng-bootstrap/ng-bootstrap';
 import { NgSelectModule } from '@ng-select/ng-select';
-import { faTrashAlt, faCheckCircle, faTimesCircle, faRedoAlt, faSun, faMoon, faCheck, faCircleHalfStroke, faDownload, faExternalLinkAlt, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faSortAmountDown, faSortAmountUp, faChevronRight, faChevronDown, faUpload, faPause, faPlay, faShareNodes, faGear } from '@fortawesome/free-solid-svg-icons';
+import { faTrashAlt, faCheckCircle, faTimesCircle, faRedoAlt, faSun, faMoon, faCheck, faCircleHalfStroke, faDownload, faExternalLinkAlt, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faSortAmountDown, faSortAmountUp, faChevronRight, faChevronDown, faUpload, faPause, faPlay, faShareNodes, faGear, faUsers, faUser, faRightFromBracket, faLink } from '@fortawesome/free-solid-svg-icons';
 import { faGithub } from '@fortawesome/free-brands-svg-icons';
 import { CookieService } from 'ngx-cookie-service';
 import { AddDownloadPayload, DownloadsService, ServerSettings, ServerSettingsChanges } from './services/downloads.service';
+import { AuthService, AuthUser, UserRole } from './services/auth.service';
 import { MeTubeSocket } from './services/metube-socket.service';
 import { SubscriptionsService } from './services/subscriptions.service';
 import { ToastService } from './services/toast.service';
@@ -60,6 +61,7 @@ import { SelectAllCheckboxComponent, ItemCheckboxComponent, ToastContainerCompon
 export class App implements AfterViewInit, OnInit, OnDestroy {
   downloads = inject(DownloadsService);
   subscriptionsSvc = inject(SubscriptionsService);
+  private auth = inject(AuthService);
   private toasts = inject(ToastService);
   private batchUrls = inject(BatchUrlsService);
   private socket = inject(MeTubeSocket);
@@ -113,11 +115,32 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   checkingSelectedSubscriptions = false;
   hasCookies = false;
 
-  // Server settings modal (runtime-editable settings, see /settings)
-  settingsModalOpen = false;
+  // Which top-level view is shown. 'login' replaces everything until a session exists.
+  page: 'home' | 'settings' | 'users' | 'login' = 'home';
+  authRequired = false;
+  currentUser: AuthUser | null = null;
+  loginUsername = '';
+  loginPassword = '';
+  loginError = '';
+  loginInProgress = false;
+
+  // Users page (admins only)
+  userList: AuthUser[] = [];
+  usersError = '';
+  newUser = { username: '', password: '', role: 'user' as UserRole };
+  editUser: { username: string; password: string } | null = null;
+  usersBusy = false;
+
+  // Settings page (runtime-editable settings, see /settings) and the direct-link builder
   settings: ServerSettings | null = null;
   settingsSaving = false;
   settingsError = '';
+  linkSource = 'PVtSAXSv7Fo';
+  linkName = 'Green-Day-Basket-Case';
+  linkFormat: 'mp4' | 'mp3' | 'jpg' = 'mp4';
+  linkTs = '';
+  linkDownload = false;
+  copiedLink = '';
   cookieUploadInProgress = false;
   themes: Theme[] = Themes;
   activeTheme: Theme | undefined;
@@ -209,6 +232,10 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   faChevronDown = faChevronDown;
   faUpload = faUpload;
   faGear = faGear;
+  faUsers = faUsers;
+  faUser = faUser;
+  faRightFromBracket = faRightFromBracket;
+  faLink = faLink;
   faPause = faPause;
   faPlay = faPlay;
   faShareNodes = faShareNodes;
@@ -334,13 +361,20 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   }
 
   ngOnInit() {
-    this.downloads.getCookieStatus().pipe(takeUntilDestroyed(this.destroyRef)).subscribe(data => {
-      this.hasCookies = !!(data && typeof data === 'object' && 'has_cookies' in data && data.has_cookies);
+    // Everything that talks to a protected endpoint waits for the auth check:
+    // without a session the socket handshake and the API answer 401.
+    this.auth.me().pipe(takeUntilDestroyed(this.destroyRef)).subscribe((res) => {
+      if (res && 'auth' in res) {
+        this.authRequired = res.auth;
+        this.currentUser = res.user;
+      }
+      if (this.authRequired && !this.currentUser) {
+        this.page = 'login';
+      } else {
+        this.startApp();
+      }
       this.cdr.markForCheck();
     });
-    this.getConfiguration();
-    this.getYtdlOptionsUpdateTime();
-    this.getYtdlOptionPresets();
     this.setTheme(this.activeTheme!);
 
     this.colorSchemeMediaQuery.addEventListener('change', this.onColorSchemeChanged);
@@ -1474,8 +1508,106 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     this.lastFocusedElement?.focus();
   }
 
-  openSettingsModal(): void {
-    this.settingsModalOpen = true;
+  private startApp(): void {
+    this.socket.connect();
+    this.downloads.getCookieStatus().pipe(takeUntilDestroyed(this.destroyRef)).subscribe(data => {
+      this.hasCookies = !!(data && typeof data === 'object' && 'has_cookies' in data && data.has_cookies);
+      this.cdr.markForCheck();
+    });
+    this.getConfiguration();
+    this.getYtdlOptionsUpdateTime();
+    this.getYtdlOptionPresets();
+  }
+
+  get isAdmin(): boolean {
+    return !this.authRequired || this.currentUser?.role === 'admin';
+  }
+
+  showPage(page: 'home' | 'settings' | 'users'): void {
+    this.page = page;
+    if (page === 'settings') this.loadSettings();
+    if (page === 'users') this.loadUsers();
+    window.scrollTo({ top: 0 });
+  }
+
+  submitLogin(): void {
+    if (this.loginInProgress) return;
+    this.loginInProgress = true;
+    this.loginError = '';
+    this.auth.login(this.loginUsername.trim(), this.loginPassword).subscribe((res) => {
+      this.loginInProgress = false;
+      if (res && 'auth' in res && res.user) {
+        this.currentUser = res.user;
+        this.loginPassword = '';
+        this.page = 'home';
+        this.startApp();
+      } else {
+        this.loginError = this.formatErrorMessage((res as { msg?: unknown })?.msg);
+      }
+      this.cdr.markForCheck();
+    });
+  }
+
+  logout(): void {
+    this.auth.logout().subscribe(() => {
+      // A full reload drops the socket and every cached state along with the session.
+      window.location.reload();
+    });
+  }
+
+  loadUsers(): void {
+    this.usersError = '';
+    this.auth.listUsers().subscribe((res) => this.applyUsersResponse(res));
+  }
+
+  private applyUsersResponse(res: unknown): void {
+    this.usersBusy = false;
+    if (res && typeof res === 'object' && 'users' in res) {
+      this.userList = (res as { users: AuthUser[] }).users;
+      this.usersError = '';
+    } else {
+      this.usersError = this.formatErrorMessage((res as { msg?: unknown })?.msg);
+    }
+    this.cdr.markForCheck();
+  }
+
+  addUser(): void {
+    if (!this.newUser.username.trim() || !this.newUser.password) return;
+    this.usersBusy = true;
+    this.auth.addUser(this.newUser.username.trim(), this.newUser.password, this.newUser.role).subscribe((res) => {
+      if (res && 'users' in res) this.newUser = { username: '', password: '', role: 'user' };
+      this.applyUsersResponse(res);
+    });
+  }
+
+  setUserRole(user: AuthUser, role: UserRole): void {
+    this.usersBusy = true;
+    this.auth.updateUser(user.username, { role }).subscribe((res) => this.applyUsersResponse(res));
+  }
+
+  startPasswordChange(user: AuthUser): void {
+    this.editUser = { username: user.username, password: '' };
+  }
+
+  savePassword(): void {
+    if (!this.editUser?.password) return;
+    this.usersBusy = true;
+    this.auth.updateUser(this.editUser.username, { password: this.editUser.password }).subscribe((res) => {
+      if (res && 'users' in res) {
+        this.editUser = null;
+        this.toasts.success('Password changed.');
+      }
+      this.applyUsersResponse(res);
+    });
+  }
+
+  async deleteUser(user: AuthUser): Promise<void> {
+    if (!(await this.toasts.confirm(`Delete user "${user.username}"?`, 'Delete'))) return;
+    this.usersBusy = true;
+    this.auth.deleteUser(user.username).subscribe((res) => this.applyUsersResponse(res));
+  }
+
+  loadSettings(): void {
     this.settings = null;
     this.settingsError = '';
     this.downloads.getSettings().subscribe((res) => {
@@ -1488,8 +1620,86 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     });
   }
 
-  closeSettingsModal(): void {
-    this.settingsModalOpen = false;
+  // --- Direct-link builder: every URL is absolute for this instance, so it can be
+  // opened or copied as-is, and carries the key whenever one is configured.
+  get directBase(): string {
+    return new URL('.', document.baseURI).href;
+  }
+
+  private directQuery(params: Record<string, string | false | undefined>): string {
+    const query = new URLSearchParams();
+    for (const [name, value] of Object.entries(params)) {
+      if (value) query.set(name, value);
+    }
+    if (this.settings?.direct_routes_key) query.set('key', this.settings.direct_routes_key);
+    const text = query.toString();
+    return text ? `?${text}` : '';
+  }
+
+  private get linkSourceValue(): string {
+    return this.linkSource.trim() || 'PVtSAXSv7Fo';
+  }
+
+  private get linkNameValue(): string {
+    return this.linkName.trim().replace(/[\s/?#]+/g, '-') || 'Green-Day-Basket-Case';
+  }
+
+  private get linkTsValue(): string | false {
+    return this.linkFormat === 'jpg' && this.linkTs.trim() ? this.linkTs.trim() : false;
+  }
+
+  watchLink(): string {
+    return `${this.directBase}watch${this.directQuery({
+      v: this.linkSourceValue,
+      format: this.linkFormat !== 'mp4' ? this.linkFormat : false,
+      ts: this.linkTsValue,
+      download: this.linkDownload && '1',
+    })}`;
+  }
+
+  dlSearchLink(): string {
+    return `${this.directBase}dl/${encodeURIComponent(this.linkNameValue)}.${this.linkFormat}${this.directQuery({
+      ts: this.linkTsValue,
+      download: this.linkDownload && '1',
+    })}`;
+  }
+
+  dlUrlLink(): string {
+    return `${this.directBase}dl/${encodeURIComponent(this.linkNameValue)}.${this.linkFormat}${this.directQuery({
+      url: this.linkSourceValue,
+      ts: this.linkTsValue,
+      download: this.linkDownload && '1',
+    })}`;
+  }
+
+  directExamples(): { label: string; url: string }[] {
+    const base = this.directBase;
+    const q = (params: Record<string, string>) => this.directQuery(params);
+    return [
+      { label: 'Play a YouTube video in the browser', url: `${base}watch${q({ v: 'PVtSAXSv7Fo' })}` },
+      { label: 'Save it as a file', url: `${base}watch${q({ v: 'PVtSAXSv7Fo', download: '1' })}` },
+      { label: 'Audio only, as mp3', url: `${base}watch${q({ v: 'PVtSAXSv7Fo', format: 'mp3' })}` },
+      { label: 'The thumbnail', url: `${base}watch${q({ v: 'PVtSAXSv7Fo', format: 'jpg' })}` },
+      { label: 'A frame at 0:42 as jpg', url: `${base}watch${q({ v: 'PVtSAXSv7Fo', format: 'jpg', ts: '42' })}` },
+      { label: 'Any site yt-dlp supports', url: `${base}watch${q({ v: 'https://vimeo.com/76979871' })}` },
+      { label: 'Search by name, top hit as mp3', url: `${base}dl/Green-Day-Basket-Case.mp3${q({})}` },
+      { label: 'Search, save as mp4', url: `${base}dl/Green-Day-Basket-Case.mp4${q({ download: '1' })}` },
+      { label: 'Explicit URL with your own file name', url: `${base}dl/basket-case.mp3${q({ url: 'https://youtu.be/PVtSAXSv7Fo' })}` },
+      { label: 'Frame at 1:05 from the search hit', url: `${base}dl/Green-Day-Basket-Case.jpg${q({ ts: '1:05' })}` },
+    ];
+  }
+
+  copyLink(url: string): void {
+    const done = () => {
+      this.copiedLink = url;
+      this.cdr.markForCheck();
+      setTimeout(() => { this.copiedLink = ''; this.cdr.markForCheck(); }, 1500);
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(url).then(done).catch(() => this.toasts.error('Failed to copy to clipboard.'));
+    } else {
+      this.toasts.error('Clipboard access needs HTTPS; copy the link from the field instead.');
+    }
   }
 
   generateDirectRoutesKey(): void {
@@ -1512,7 +1722,6 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
       if (res && 'direct_routes' in res) {
         this.settings = res;
         this.toasts.success('Settings saved.');
-        this.closeSettingsModal();
       } else {
         this.settingsError = `Could not save settings: ${this.formatErrorMessage((res as { msg?: unknown })?.msg)}`;
       }

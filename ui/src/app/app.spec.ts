@@ -4,6 +4,7 @@ import { Subject, of } from 'rxjs';
 import { App } from './app';
 import { DownloadsService } from './services/downloads.service';
 import { SubscriptionsService } from './services/subscriptions.service';
+import { AuthService } from './services/auth.service';
 import { ToastService } from './services/toast.service';
 import { CookieService } from 'ngx-cookie-service';
 import { Download } from './interfaces';
@@ -76,6 +77,24 @@ class DownloadsServiceStub {
   }
 }
 
+class AuthServiceStub {
+  me() {
+    return of({ auth: false, user: null });
+  }
+
+  login() {
+    return of({ auth: true, user: { username: 'x', role: 'admin', locked: false } });
+  }
+
+  logout() {
+    return of({ auth: true, user: null });
+  }
+
+  listUsers() {
+    return of({ users: [] });
+  }
+}
+
 class SubscriptionsServiceStub {
   subscriptions = new Map();
   subscriptionsChanged = new Subject<void>();
@@ -140,6 +159,7 @@ describe('App', () => {
       providers: [
         { provide: DownloadsService, useValue: downloads },
         { provide: SubscriptionsService, useClass: SubscriptionsServiceStub },
+        { provide: AuthService, useClass: AuthServiceStub },
         { provide: CookieService, useClass: CookieServiceStub },
         {
           provide: HttpClient,

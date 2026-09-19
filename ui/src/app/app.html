@@ -1,6 +1,6 @@
 <nav class="navbar navbar-expand-md navbar-dark">
   <div class="container-fluid">
-    <a class="navbar-brand d-flex align-items-center" href="#">
+    <a class="navbar-brand d-flex align-items-center" href="#" (click)="showPage('home'); $event.preventDefault()">
       <img src="assets/icons/android-chrome-192x192.png" alt="MeTube Logo" height="32" class="me-2">
       MeTube
     </a>
@@ -49,10 +49,28 @@
     </div>
     -->
     <div class="navbar-nav ms-auto">
-      <button type="button" class="btn btn-link nav-link py-2 px-0 px-sm-2 d-flex align-items-center"
-        aria-label="Settings" ngbTooltip="Settings" (click)="openSettingsModal()">
-        <fa-icon [icon]="faGear" />
-      </button>
+      @if (page !== 'login' && isAdmin) {
+        <button type="button" class="btn btn-link nav-link py-2 px-0 px-sm-2 d-flex align-items-center"
+          [class.active]="page === 'settings'"
+          aria-label="Settings" ngbTooltip="Settings and direct links" (click)="showPage('settings')">
+          <fa-icon [icon]="faGear" />
+        </button>
+        @if (authRequired) {
+          <button type="button" class="btn btn-link nav-link py-2 px-0 px-sm-2 d-flex align-items-center"
+            [class.active]="page === 'users'"
+            aria-label="Users" ngbTooltip="Users" (click)="showPage('users')">
+            <fa-icon [icon]="faUsers" />
+          </button>
+        }
+      }
+      @if (currentUser) {
+        <button type="button" class="btn btn-link nav-link py-2 px-0 px-sm-2 d-flex align-items-center"
+          [attr.aria-label]="'Log out ' + currentUser.username" [ngbTooltip]="'Log out ' + currentUser.username" (click)="logout()">
+          <fa-icon [icon]="faUser" class="me-1" />
+          <span class="d-none d-sm-inline me-2">{{ currentUser.username }}</span>
+          <fa-icon [icon]="faRightFromBracket" />
+        </button>
+      }
       <div class="nav-item dropdown" ngbDropdown placement="bottom-end">
         <button class="btn btn-link nav-link py-2 px-0 px-sm-2 dropdown-toggle d-flex align-items-center"
           id="theme-select"
@@ -88,6 +106,282 @@
 </nav>
 
 <main role="main" class="container container-xl">
+  @if (page === 'login') {
+    <div class="row justify-content-center mt-5">
+      <div class="col-md-5 col-lg-4">
+        <form class="card p-4" (ngSubmit)="submitLogin()">
+          <h5 class="card-title mb-3">Log in</h5>
+          <div class="mb-3">
+            <label for="login-username" class="form-label">Username</label>
+            <input id="login-username" name="username" type="text" class="form-control" autocomplete="username" required
+              [(ngModel)]="loginUsername" [disabled]="loginInProgress">
+          </div>
+          <div class="mb-3">
+            <label for="login-password" class="form-label">Password</label>
+            <input id="login-password" name="password" type="password" class="form-control" autocomplete="current-password" required
+              [(ngModel)]="loginPassword" [disabled]="loginInProgress">
+          </div>
+          @if (loginError) {
+            <div class="alert alert-danger py-2" role="alert">{{ loginError }}</div>
+          }
+          <button type="submit" class="btn btn-primary w-100" [disabled]="loginInProgress || !loginUsername || !loginPassword">
+            @if (loginInProgress) {
+              <span class="spinner-border spinner-border-sm me-2" role="status"></span>
+            }
+            Log in
+          </button>
+        </form>
+      </div>
+    </div>
+  } @else if (page === 'settings') {
+    <h4 class="mb-3">Settings</h4>
+    <div class="card mb-4">
+      <div class="card-body">
+        <h5 class="card-title">Direct streaming routes</h5>
+        @if (settings) {
+          <div class="form-check form-switch mb-3">
+            <input class="form-check-input" type="checkbox" role="switch" id="settings-direct-routes"
+              [(ngModel)]="settings.direct_routes"
+              [disabled]="settings.locked.direct_routes || settingsSaving">
+            <label class="form-check-label" for="settings-direct-routes">
+              Enable <code>/watch?v=…</code> and <code>/dl/name.ext</code>
+            </label>
+            <div class="form-text">
+              @if (settings.locked.direct_routes) {
+                Set by the <code>DIRECT_ROUTES</code> environment variable.
+              } @else {
+                Fetch one item and stream it back without saving it. Takes effect immediately.
+              }
+            </div>
+          </div>
+          <label for="settings-direct-routes-key" class="form-label">Access key</label>
+          <div class="input-group">
+            <input id="settings-direct-routes-key" type="text" class="form-control" autocomplete="off"
+              placeholder="Empty: no key required"
+              [(ngModel)]="settings.direct_routes_key"
+              [disabled]="settings.locked.direct_routes_key || settingsSaving">
+            <button type="button" class="btn btn-outline-secondary" (click)="generateDirectRoutesKey()"
+              [disabled]="settings.locked.direct_routes_key || settingsSaving">Generate</button>
+          </div>
+          <div class="form-text">
+            @if (settings.locked.direct_routes_key) {
+              Set by the <code>DIRECT_ROUTES_KEY</code> environment variable.
+            } @else {
+              Required as <code>?key=…</code> or an <code>X-Api-Key</code> header. Direct links never need a login, only this key.
+            }
+          </div>
+          <div class="form-text mb-3">
+            Users and their passwords are managed on the Users page; the first admin comes from
+            <code>ADMIN_USERNAME</code> / <code>ADMIN_PASSWORD</code>.
+          </div>
+          <button type="button" class="btn btn-primary" (click)="saveSettings()" [disabled]="settingsSaving">
+            @if (settingsSaving) {
+              <span class="spinner-border spinner-border-sm me-2" role="status"></span>
+            }
+            Save
+          </button>
+        } @else if (!settingsError) {
+          <span class="spinner-border spinner-border-sm" role="status"></span>
+        }
+        @if (settingsError) {
+          <div class="alert alert-danger mt-3 mb-0" role="alert">{{ settingsError }}</div>
+        }
+      </div>
+    </div>
+
+    <div class="card mb-4">
+      <div class="card-body">
+        <h5 class="card-title"><fa-icon [icon]="faLink" class="me-2" />Link builder</h5>
+        <p class="card-text text-muted">
+          Build a direct link for this instance. Every link below is ready to open or copy
+          @if (settings?.direct_routes_key) { and already carries the access key }.
+        </p>
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label for="link-source" class="form-label">Video ID or URL</label>
+            <input id="link-source" type="text" class="form-control" [(ngModel)]="linkSource" placeholder="PVtSAXSv7Fo or https://…">
+            <div class="form-text">A YouTube ID or any URL yt-dlp understands. Used by <code>/watch</code> and the <code>?url=</code> variant.</div>
+          </div>
+          <div class="col-md-6">
+            <label for="link-name" class="form-label">Search term / file name</label>
+            <input id="link-name" type="text" class="form-control" [(ngModel)]="linkName" placeholder="Green-Day-Basket-Case">
+            <div class="form-text">Used by <code>/dl/</code>: without <code>?url=</code> it becomes a search, otherwise just the file name.</div>
+          </div>
+          <div class="col-sm-4">
+            <label for="link-format" class="form-label">Format</label>
+            <select id="link-format" class="form-select" [(ngModel)]="linkFormat">
+              <option value="mp4">mp4 — video (up to 1080p)</option>
+              <option value="mp3">mp3 — audio with cover and tags</option>
+              <option value="jpg">jpg — thumbnail or a frame</option>
+            </select>
+          </div>
+          <div class="col-sm-4">
+            <label for="link-ts" class="form-label">Frame position (jpg only)</label>
+            <input id="link-ts" type="text" class="form-control" [(ngModel)]="linkTs" placeholder="42, 1:30 or 1m30s" [disabled]="linkFormat !== 'jpg'">
+          </div>
+          <div class="col-sm-4 d-flex align-items-end">
+            <div class="form-check form-switch mb-2">
+              <input class="form-check-input" type="checkbox" role="switch" id="link-download" [(ngModel)]="linkDownload">
+              <label class="form-check-label" for="link-download">Save instead of playing (<code>download=1</code>)</label>
+            </div>
+          </div>
+        </div>
+        <div class="mt-4">
+          @for (link of [
+            { label: '/watch — by ID or URL', url: watchLink() },
+            { label: '/dl — search by name', url: dlSearchLink() },
+            { label: '/dl — explicit URL, your own file name', url: dlUrlLink() }
+          ]; track link.label) {
+            <div class="mb-3">
+              <div class="small text-muted mb-1">{{ link.label }}</div>
+              <div class="input-group">
+                <input type="text" class="form-control font-monospace" readonly [value]="link.url" (focus)="$any($event.target).select()">
+                <button type="button" class="btn btn-outline-secondary" (click)="copyLink(link.url)" [ngbTooltip]="copiedLink === link.url ? 'Copied' : 'Copy'">
+                  <fa-icon [icon]="copiedLink === link.url ? faCheck : faCopy" />
+                </button>
+                <a class="btn btn-outline-primary" [href]="link.url" target="_blank" rel="noopener" ngbTooltip="Open in a new tab">
+                  <fa-icon [icon]="faExternalLinkAlt" />
+                </a>
+              </div>
+            </div>
+          }
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-4">
+      <div class="card-body">
+        <h5 class="card-title">What the routes can do</h5>
+        <div class="table-responsive">
+          <table class="table table-sm align-middle mb-4">
+            <thead>
+              <tr><th>Route</th><th>Parameters</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="text-nowrap"><code>/watch?v=…</code></td>
+                <td>
+                  <code>v</code> YouTube ID or any yt-dlp URL (required) ·
+                  <code>format</code> <code>mp4</code> (default), <code>mp3</code>, <code>jpg</code> ·
+                  <code>ts</code> frame position for jpg (<code>42</code>, <code>1:30</code>, <code>1m30s</code>); without it the thumbnail ·
+                  <code>download=1</code> save instead of play ·
+                  <code>key</code> the access key when one is set
+                </td>
+              </tr>
+              <tr>
+                <td class="text-nowrap"><code>/dl/&lt;name&gt;.&lt;ext&gt;</code></td>
+                <td>
+                  <code>ext</code> <code>mp4</code>, <code>mp3</code>, <code>jpg</code> picks the format ·
+                  <code>name</code> becomes a search (<code>-</code>, <code>_</code>, <code>+</code>, <code>.</code> turn into spaces) and the top hit is used, or only the file name when <code>url</code> is given ·
+                  <code>url</code> fetch this instead of searching ·
+                  <code>ts</code>, <code>download</code>, <code>key</code> as above
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <h6>Examples for this instance</h6>
+        <div class="table-responsive">
+          <table class="table table-sm align-middle mb-0">
+            <tbody>
+              @for (example of directExamples(); track example.label) {
+                <tr>
+                  <td class="text-nowrap">{{ example.label }}</td>
+                  <td class="w-100">
+                    <a [href]="example.url" target="_blank" rel="noopener" class="font-monospace text-break">{{ example.url }}</a>
+                  </td>
+                  <td>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" (click)="copyLink(example.url)" [ngbTooltip]="copiedLink === example.url ? 'Copied' : 'Copy'">
+                      <fa-icon [icon]="copiedLink === example.url ? faCheck : faCopy" />
+                    </button>
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+        <p class="text-muted small mt-3 mb-0">
+          Responses: <code>200</code> with the file (range requests work, so seeking in a video does too) ·
+          <code>400</code> bad parameter · <code>403</code> missing or wrong key · <code>404</code> routes disabled ·
+          <code>502</code> yt-dlp or ffmpeg failed (unavailable video, no search hit, <code>ts</code> past the end).
+          Full documentation: <a href="https://fgilde.github.io/metube/direct-routes" target="_blank" rel="noopener">fgilde.github.io/metube/direct-routes</a>.
+        </p>
+      </div>
+    </div>
+  } @else if (page === 'users') {
+    <h4 class="mb-3">Users</h4>
+    @if (usersError) {
+      <div class="alert alert-danger" role="alert">{{ usersError }}</div>
+    }
+    <div class="card mb-4">
+      <div class="table-responsive">
+        <table class="table align-middle mb-0">
+          <thead>
+            <tr><th>Username</th><th>Role</th><th class="text-end">Actions</th></tr>
+          </thead>
+          <tbody>
+            @for (user of userList; track user.username) {
+              <tr>
+                <td>
+                  {{ user.username }}
+                  @if (user.username === currentUser?.username) { <span class="badge text-bg-secondary ms-2">you</span> }
+                  @if (user.locked) { <span class="badge text-bg-info ms-2" ngbTooltip="Defined by ADMIN_USERNAME / ADMIN_PASSWORD; change it there">env</span> }
+                </td>
+                <td>
+                  <select class="form-select form-select-sm w-auto" [ngModel]="user.role" (ngModelChange)="setUserRole(user, $event)" [disabled]="user.locked || usersBusy" [attr.aria-label]="'Role of ' + user.username">
+                    <option value="admin">admin</option>
+                    <option value="user">user</option>
+                  </select>
+                </td>
+                <td class="text-end text-nowrap">
+                  @if (editUser?.username === user.username) {
+                    <form class="d-inline-flex gap-1" (ngSubmit)="savePassword()">
+                      <input type="password" class="form-control form-control-sm" name="password" placeholder="New password" autocomplete="new-password" [(ngModel)]="editUser!.password" [disabled]="usersBusy">
+                      <button type="submit" class="btn btn-sm btn-primary" [disabled]="usersBusy || !editUser?.password">Save</button>
+                      <button type="button" class="btn btn-sm btn-outline-secondary" (click)="editUser = null">Cancel</button>
+                    </form>
+                  } @else {
+                    <button type="button" class="btn btn-sm btn-outline-secondary me-1" (click)="startPasswordChange(user)" [disabled]="user.locked || usersBusy">Change password</button>
+                    <button type="button" class="btn btn-sm btn-outline-danger" (click)="deleteUser(user)" [disabled]="user.locked || usersBusy" [attr.aria-label]="'Delete ' + user.username">
+                      <fa-icon [icon]="faTrashAlt" />
+                    </button>
+                  }
+                </td>
+              </tr>
+            } @empty {
+              <tr><td colspan="3" class="text-muted">No users yet.</td></tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-body">
+        <h5 class="card-title">Add user</h5>
+        <form class="row g-2 align-items-end" (ngSubmit)="addUser()">
+          <div class="col-md-4">
+            <label for="new-username" class="form-label">Username</label>
+            <input id="new-username" name="username" type="text" class="form-control" autocomplete="off" [(ngModel)]="newUser.username" [disabled]="usersBusy">
+          </div>
+          <div class="col-md-4">
+            <label for="new-password" class="form-label">Password</label>
+            <input id="new-password" name="password" type="password" class="form-control" autocomplete="new-password" [(ngModel)]="newUser.password" [disabled]="usersBusy">
+          </div>
+          <div class="col-md-2">
+            <label for="new-role" class="form-label">Role</label>
+            <select id="new-role" name="role" class="form-select" [(ngModel)]="newUser.role" [disabled]="usersBusy">
+              <option value="user">user</option>
+              <option value="admin">admin</option>
+            </select>
+          </div>
+          <div class="col-md-2">
+            <button type="submit" class="btn btn-primary w-100" [disabled]="usersBusy || !newUser.username || !newUser.password">Add</button>
+          </div>
+        </form>
+        <div class="form-text mt-2">Admins manage users and settings; users can do everything else. Letters, digits and <code>. _ @ -</code> in usernames.</div>
+      </div>
+    </div>
+  } @else {
   <form #f="ngForm">
     <div class="container add-url-box">
       <!-- Main URL Input with Download Button -->
@@ -688,73 +982,6 @@
     </div>
   </div>
 
-  <!-- Settings Modal -->
-  <div class="modal fade" tabindex="-1" role="dialog"
-  aria-modal="true"
-  aria-labelledby="settings-modal-title"
-  [class.show]="settingsModalOpen"
-  [style.display]="settingsModalOpen ? 'block' : 'none'">
-    <div class="modal-dialog" role="document">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h5 id="settings-modal-title" class="modal-title">Settings</h5>
-          <button type="button" class="btn-close" aria-label="Close" (click)="closeSettingsModal()"></button>
-        </div>
-        <div class="modal-body">
-          @if (settings) {
-            <div class="form-check form-switch mb-3">
-              <input class="form-check-input" type="checkbox" role="switch" id="settings-direct-routes"
-                [(ngModel)]="settings.direct_routes"
-                [disabled]="settings.locked.direct_routes || settingsSaving">
-              <label class="form-check-label" for="settings-direct-routes">
-                Direct streaming routes (<code>/watch?v=…</code>, <code>/dl/name.mp3</code>)
-              </label>
-              <div class="form-text">
-                @if (settings.locked.direct_routes) {
-                  Set by the <code>DIRECT_ROUTES</code> environment variable.
-                } @else {
-                  Fetch one item and stream it back without saving it. Takes effect immediately.
-                }
-              </div>
-            </div>
-            <label for="settings-direct-routes-key" class="form-label">Access key for direct routes</label>
-            <div class="input-group">
-              <input id="settings-direct-routes-key" type="text" class="form-control" autocomplete="off"
-                placeholder="Empty: no key required"
-                [(ngModel)]="settings.direct_routes_key"
-                [disabled]="settings.locked.direct_routes_key || settingsSaving">
-              <button type="button" class="btn btn-outline-secondary" (click)="generateDirectRoutesKey()"
-                [disabled]="settings.locked.direct_routes_key || settingsSaving">Generate</button>
-            </div>
-            <div class="form-text">
-              @if (settings.locked.direct_routes_key) {
-                Set by the <code>DIRECT_ROUTES_KEY</code> environment variable.
-              } @else {
-                Required as <code>?key=…</code> or an <code>X-Api-Key</code> header. Requests carrying the key skip Basic auth.
-              }
-            </div>
-            <div class="form-text mt-3">
-              Basic auth (<code>BASIC_AUTH_USERNAME</code> / <code>BASIC_AUTH_PASSWORD</code>) is configured through environment variables only.
-            </div>
-          } @else if (!settingsError) {
-            <span class="spinner-border spinner-border-sm" role="status"></span>
-          }
-          @if (settingsError) {
-            <div class="alert alert-danger mt-3 mb-0" role="alert">{{ settingsError }}</div>
-          }
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-secondary" (click)="closeSettingsModal()">Cancel</button>
-          <button type="button" class="btn btn-primary" (click)="saveSettings()" [disabled]="!settings || settingsSaving">
-            @if (settingsSaving) {
-              <span class="spinner-border spinner-border-sm me-2" role="status"></span>
-            }
-            Save
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
 
 
   @if (downloads.loading) {
@@ -1180,6 +1407,7 @@
       </table>
     </div>
   }
+  }
 </main><!-- /.container -->
 
 <footer class="footer navbar-dark bg-dark py-3 mt-5">
@@ -1205,9 +1433,13 @@
         @if (ytDlpOptionsUpdateTime) {
           <div class="version-separator"></div>
         }
-        <a href="https://github.com/alexta69/metube" target="_blank" class="github-link">
+        <a href="https://github.com/fgilde/metube" target="_blank" rel="noopener" class="github-link">
           <fa-icon [icon]="faGithub" />
-          <span>GitHub</span>
+          <span>fgilde/metube</span>
+        </a>
+        <div class="version-separator"></div>
+        <a href="https://gilde.org" target="_blank" rel="noopener" class="github-link">
+          <span>gilde.org</span>
         </a>
       </div>
     }

@@ -10,8 +10,6 @@ from aiohttp import web
 from aiohttp.web import GracefulExit
 from aiohttp.log import access_logger
 import ssl
-import base64
-import binascii
 import hmac
 import socket
 import socketio
@@ -26,6 +24,7 @@ from functools import partial
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from watchfiles import DefaultFilter, Change, awatch
 
+import auth
 import bg_tasks
 import direct
 from state_store import AtomicJsonStore
@@ -105,8 +104,8 @@ class Config:
         'LOGLEVEL': 'INFO',
         'ENABLE_ACCESSLOG': 'false',
         'YTDL_NIGHTLY_UPDATE_TIME': '',
-        'BASIC_AUTH_USERNAME': '',
-        'BASIC_AUTH_PASSWORD': '',
+        'ADMIN_USERNAME': '',
+        'ADMIN_PASSWORD': '',
         'DIRECT_ROUTES': 'true',
         'DIRECT_ROUTES_KEY': '',
     }
@@ -141,9 +140,9 @@ class Config:
         if not self.URL_PREFIX.endswith('/'):
             self.URL_PREFIX += '/'
 
-        # Half-configured Basic auth would accept an empty password.
-        if bool(self.BASIC_AUTH_USERNAME) != bool(self.BASIC_AUTH_PASSWORD):
-            log.error('BASIC_AUTH_USERNAME and BASIC_AUTH_PASSWORD must be set together')
+        # A half-configured admin would either be unreachable or have an empty password.
+        if bool(self.ADMIN_USERNAME) != bool(self.ADMIN_PASSWORD):
+            log.error('ADMIN_USERNAME and ADMIN_PASSWORD must be set together')
             sys.exit(1)
 
         # Strip trailing slashes from the download directories. get_custom_dirs()
@@ -399,34 +398,56 @@ async def state_dir_guard(request, handler):
     return await handler(request)
 
 
+users = auth.UserStore(config.STATE_DIR, config.ADMIN_USERNAME, config.ADMIN_PASSWORD)
+_UI_DIST = os.path.join(config.BASE_DIR, 'ui/dist/metube/browser')
+_PUBLIC_PATHS = frozenset(
+    config.URL_PREFIX + p for p in ('', 'login', 'logout', 'me', 'robots.txt', 'version')
+) | {'/', config.URL_PREFIX[:-1]}
+
+
 def _is_direct_route(path: str) -> bool:
     return path == config.URL_PREFIX + 'watch' or path.startswith(config.URL_PREFIX + 'dl/')
 
 
-def _basic_auth_ok(request) -> bool:
-    scheme, _, token = request.headers.get('Authorization', '').partition(' ')
-    if scheme.lower() != 'basic':
-        return False
-    try:
-        login, _, password = base64.b64decode(token.strip(), validate=True).decode('utf-8').partition(':')
-    except (binascii.Error, UnicodeDecodeError):
-        return False
-    # '&' rather than 'and' so both comparisons always run.
-    return (hmac.compare_digest(login.encode(), config.BASIC_AUTH_USERNAME.encode())
-            & hmac.compare_digest(password.encode(), config.BASIC_AUTH_PASSWORD.encode()))
+def _is_public(request) -> bool:
+    # Reachable without a session: CORS preflights, the login endpoints, the
+    # SPA shell and its bundles (the login screen is part of the app), and the
+    # direct routes, which are deliberately independent of users and gated by
+    # DIRECT_ROUTES_KEY alone. The download directories are not files of the
+    # UI bundle, so they stay protected.
+    path = request.path
+    if request.method == 'OPTIONS' or path in _PUBLIC_PATHS or _is_direct_route(path):
+        return True
+    rel = path[len(config.URL_PREFIX):] if path.startswith(config.URL_PREFIX) else ''
+    return bool(rel) and '..' not in rel and os.path.isfile(os.path.join(_UI_DIST, rel))
+
+
+async def _current_user(request):
+    """The user behind a session cookie or an ``Authorization: Basic`` header (for scripts)."""
+    token = request.cookies.get(auth.SESSION_COOKIE)
+    if token:
+        return users.user_from_token(token)
+    creds = auth.parse_basic_auth(request.headers.get('Authorization', ''))
+    if creds:
+        # scrypt takes tens of milliseconds; keep it off the event loop.
+        return await asyncio.get_running_loop().run_in_executor(None, users.authenticate, *creds)
+    return None
 
 
 @web.middleware
 async def auth_guard(request, handler):
-    # Basic auth covers the whole app (UI, API, socket.io) once configured.
-    # CORS preflights carry no credentials by design and pass. Direct routes
-    # that have their own key are exempt: the key is their credential, so a
-    # /dl/... link can be handed to someone without the UI password.
-    if (config.BASIC_AUTH_USERNAME and request.method != 'OPTIONS'
-            and not (config.DIRECT_ROUTES_KEY and _is_direct_route(request.path))
-            and not _basic_auth_ok(request)):
-        raise web.HTTPUnauthorized(headers={'WWW-Authenticate': 'Basic realm="MeTube"'})
+    if users.enabled and not _is_public(request):
+        user = await _current_user(request)
+        if user is None:
+            raise web.HTTPUnauthorized(text='login required')
+        request['user'] = user
     return await handler(request)
+
+
+def _require_admin(request) -> None:
+    user = request.get('user')
+    if users.enabled and (user is None or user.get('role') != 'admin'):
+        raise web.HTTPForbidden(text='admin only')
 
 
 app = web.Application(middlewares=[auth_guard, state_dir_guard])
@@ -1431,12 +1452,13 @@ async def _direct_serve(request, source: str, ext: str):
 
 @routes.get(config.URL_PREFIX + 'watch')
 async def watch(request):
-    """``/watch?v=<id-or-url>[&download=1]`` — the video as mp4, like YouTube's own path."""
+    """``/watch?v=<id-or-url>[&format=mp4|mp3|jpg][&ts=90][&download=1]`` — like YouTube's own path."""
     _direct_enabled_or_404()
     source = (request.query.get('v') or '').strip()
     if not source:
         raise web.HTTPBadRequest(reason="missing 'v'")
-    return await _direct_serve(request, source, 'mp4')
+    ext = direct.parse_ext(request.query.get('format') or 'mp4')
+    return await _direct_serve(request, source, ext)
 
 
 @routes.get(config.URL_PREFIX + 'dl/{name}')
@@ -1448,13 +1470,78 @@ async def dl(request):
     return await _direct_serve(request, source, ext)
 
 
+def _me_payload(user) -> dict:
+    return {'auth': users.enabled, 'user': user}
+
+
+@routes.get(config.URL_PREFIX + 'me')
+async def me(request):
+    return web.json_response(_me_payload(await _current_user(request) if users.enabled else None))
+
+
+@routes.post(config.URL_PREFIX + 'login')
+async def login(request):
+    post = await _read_json_request(request)
+    name, password = str(post.get('username') or ''), str(post.get('password') or '')
+    user = await asyncio.get_running_loop().run_in_executor(None, users.authenticate, name, password)
+    if user is None:
+        await asyncio.sleep(1)  # ponytail: a flat delay is the whole brute-force defence; add lockout if it ever matters
+        raise web.HTTPUnauthorized(text='invalid username or password')
+    response = web.json_response(_me_payload(user))
+    response.set_cookie(auth.SESSION_COOKIE, users.issue_token(name), max_age=auth.SESSION_TTL,
+                        path=config.URL_PREFIX, httponly=True, samesite='Lax', secure=config.HTTPS)
+    return response
+
+
+@routes.post(config.URL_PREFIX + 'logout')
+async def logout(request):
+    response = web.json_response({'auth': users.enabled, 'user': None})
+    response.del_cookie(auth.SESSION_COOKIE, path=config.URL_PREFIX)
+    return response
+
+
+@routes.get(config.URL_PREFIX + 'users')
+async def users_list(request):
+    _require_admin(request)
+    return web.json_response({'users': users.list()})
+
+
+async def _users_change(request, action):
+    _require_admin(request)
+    post = await _read_json_request(request)
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(None, partial(action, post))
+    except ValueError as exc:
+        raise web.HTTPBadRequest(reason=str(exc))
+    return web.json_response({'status': 'ok', 'user': result, 'users': users.list()})
+
+
+@routes.post(config.URL_PREFIX + 'users')
+async def users_add(request):
+    return await _users_change(request, lambda post: users.add(
+        str(post.get('username') or ''), post.get('password'), post.get('role') or 'user'))
+
+
+@routes.post(config.URL_PREFIX + 'users/update')
+async def users_update(request):
+    return await _users_change(request, lambda post: users.update(
+        str(post.get('username') or ''), password=post.get('password'), role=post.get('role')))
+
+
+@routes.post(config.URL_PREFIX + 'users/delete')
+async def users_delete(request):
+    return await _users_change(request, lambda post: users.delete(str(post.get('username') or '')))
+
+
 @routes.get(config.URL_PREFIX + 'settings')
 async def settings_get(request):
+    _require_admin(request)
     return web.json_response(_settings_payload())
 
 
 @routes.post(config.URL_PREFIX + 'settings')
 async def settings_update(request):
+    _require_admin(request)
     post = await _read_json_request(request)
     changes = {}
     for key, typ in _SETTING_TYPES.items():

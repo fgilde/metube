@@ -12,6 +12,8 @@ export class MeTubeSocket extends Socket {
 
     const path =
       document.location.pathname.replace(/share-target/, '') + 'socket.io';
-    super({ url: '', options: { path } }, appRef);
+    // Connected by the app once it knows whether a login is required; the
+    // handshake is rejected with 401 otherwise and would retry forever.
+    super({ url: '', options: { path, autoConnect: false } }, appRef);
   }
 }

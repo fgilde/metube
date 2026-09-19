@@ -39,13 +39,19 @@ class FetchError(Exception):
     """yt-dlp or ffmpeg could not produce the requested file."""
 
 
+def parse_ext(ext: str) -> str:
+    """Normalise a requested format/extension; ``jpeg`` is ``jpg``."""
+    ext = (ext or '').strip().lower().lstrip('.')
+    ext = {'jpeg': 'jpg'}.get(ext, ext)
+    if ext not in EXTENSIONS:
+        raise web.HTTPBadRequest(reason=f'format must be one of {list(EXTENSIONS)}')
+    return ext
+
+
 def parse_name(name: str) -> tuple[str, str]:
     """Split ``Greenday-Basketcase.mp3`` into a search term and a normalised extension."""
     stem, _, ext = name.rpartition('.')
-    ext = ext.lower()
-    ext = {'jpeg': 'jpg'}.get(ext, ext)
-    if ext not in EXTENSIONS:
-        raise web.HTTPBadRequest(reason=f'extension must be one of {list(EXTENSIONS)}')
+    ext = parse_ext(ext)
     term = re.sub(r'[-_+.\s]+', ' ', stem).strip()
     if not term:
         raise web.HTTPBadRequest(reason='missing name before the extension')
