@@ -6,6 +6,8 @@ on:
       - 'master'
     paths-ignore:
       - '**.md'
+  # Started by update-yt-dlp after it pushes a lock bump, and available by hand.
+  workflow_dispatch:
 
 jobs:
   quality-checks:
