@@ -18,8 +18,9 @@ import yt_dlp
 import yt_dlp.networking.impersonate
 import bg_tasks
 from dl_formats import merge_ytdl_option_layers
+from download_options import DownloadOptions
 from state_store import AtomicJsonStore, read_legacy_shelf
-from url_guard import validate_url
+from url_guard import validate_url, download_proxies
 
 log = logging.getLogger("subscriptions")
 
@@ -31,6 +32,7 @@ _MAX_CONCURRENT_CHECKS = 4
 VIDEO_ONLY_MSG = (
     "This URL points to a single video, not a channel or playlist. Use Download instead."
 )
+NO_ENTRIES_MSG = "No entries found at this URL."
 _MEDIA_HINT_FIELDS = (
     "duration",
     "timestamp",
@@ -62,8 +64,10 @@ def _build_ydl_params(
         "ignore_no_formats_error": True,
         "lazy_playlist": True,
         "paths": {"home": config.DOWNLOAD_DIR, "temp": config.TEMP_DIR},
-        **config.YTDL_OPTIONS,
-        **(extra_opts or {}),
+        # Copies: YoutubeDL fills its defaults into nested dicts (outtmpl) in
+        # place, which would otherwise rewrite YTDL_OPTIONS and the presets.
+        **copy.deepcopy(config.YTDL_OPTIONS),
+        **copy.deepcopy(extra_opts or {}),
         # A scan is a poll, not an add: it runs on a timer and queues items
         # through the download queue, which writes the feed metadata itself.
         # yt-dlp emits the playlist-level infojson/description/thumbnail
@@ -95,7 +99,7 @@ def _is_media_entry(entry: Any) -> bool:
 
 
 def extract_flat_playlist(
-    config, url: str, playlistend: int, *, extra_opts: Optional[dict[str, Any]] = None, _depth: int = 0
+    config, url: str, playlistend: Optional[int], *, extra_opts: Optional[dict[str, Any]] = None, _depth: int = 0
 ):
     """Return (info_dict, entries_list) for playlist/channel URLs."""
     params = _build_ydl_params(config, playlistend=playlistend, extra_opts=extra_opts)
@@ -116,12 +120,18 @@ def extract_flat_playlist(
         if media_entries:
             return info, media_entries
         if _depth < 1:
+            proxies = download_proxies({**config.YTDL_OPTIONS, **(extra_opts or {})})
             for ent in entries[:5]:
                 nested_url = _entry_video_url(ent)
                 if not nested_url:
                     continue
-                # nested_url comes from remote playlist content; guard it too.
-                if validate_url(nested_url, allow_private=getattr(config, "ALLOW_PRIVATE_ADDRESSES", False)) is not None:
+                # nested_url comes from remote playlist content; guard it too,
+                # against the same proxy map this scan is using.
+                if validate_url(
+                    nested_url,
+                    allow_private=getattr(config, "ALLOW_PRIVATE_ADDRESSES", False),
+                    proxies=proxies,
+                ) is not None:
                     continue
                 nested_info, nested_entries = extract_flat_playlist(
                     config,
@@ -141,6 +151,76 @@ def extract_flat_playlist(
 
 def _entry_video_url(entry: dict) -> Optional[str]:
     return entry.get("webpage_url") or entry.get("url")
+
+
+async def browse_playlist(
+    config,
+    url: str,
+    playlist_item_limit: int,
+    ytdl_options_presets: Optional[list[str]],
+    ytdl_options_overrides: Optional[dict[str, Any]],
+) -> dict:
+    """Flat-probe a playlist/channel URL and return its entries for the Browse dialog.
+
+    Read-only: nothing is downloaded, queued or persisted. A limit <= 0 means
+    no limit.
+    """
+    extra = merge_ytdl_option_layers(
+        ytdl_options_presets, ytdl_options_overrides, config.YTDL_OPTIONS_PRESETS
+    )
+    loop = asyncio.get_running_loop()
+    # SSRF guard, same as add_subscription: block non-http(s) schemes and
+    # internal/metadata hosts before yt-dlp fetches anything.
+    proxies = download_proxies({**config.YTDL_OPTIONS, **extra})
+    url_error = await loop.run_in_executor(
+        None,
+        partial(
+            validate_url,
+            url,
+            allow_private=getattr(config, "ALLOW_PRIVATE_ADDRESSES", False),
+            proxies=proxies,
+        ),
+    )
+    if url_error is not None:
+        log.warning('Rejected browse URL "%s": %s', url, url_error)
+        return {"status": "error", "msg": url_error}
+    try:
+        info, entries = await loop.run_in_executor(
+            None,
+            partial(
+                extract_flat_playlist,
+                config,
+                url,
+                playlist_item_limit if playlist_item_limit > 0 else None,
+                extra_opts=extra,
+            ),
+        )
+    except yt_dlp.utils.YoutubeDLError as exc:
+        return {"status": "error", "msg": str(exc)}
+
+    if not info:
+        return {"status": "error", "msg": "Could not resolve URL"}
+    if (info.get("_type") or "video") not in ("playlist", "channel"):
+        return {"status": "error", "msg": VIDEO_ONLY_MSG}
+
+    items: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = _entry_video_url(entry)
+        if not entry_url:
+            continue
+        duration = entry.get("duration")
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            duration = None
+        items.append({
+            "url": entry_url,
+            "title": entry.get("title") or entry_url,
+            "duration": duration,
+        })
+    if not items:
+        return {"status": "error", "msg": NO_ENTRIES_MSG}
+    return {"status": "ok", "title": info.get("title") or url, "entries": items}
 
 
 def _entry_id(entry: dict) -> Optional[str]:
@@ -183,6 +263,7 @@ class SubscriptionInfo:
     playlist_item_limit: int = 0
     split_by_chapters: bool = False
     sponsorblock: bool = False
+    audio_tags: str = "with_cover"
     chapter_template: str = ""
     subtitle_language: str = "en"
     subtitle_mode: str = "prefer_manual"
@@ -204,6 +285,29 @@ class SubscriptionInfo:
 
     def seen_set(self) -> set[str]:
         return set(self.seen_ids)
+
+    def download_options(self) -> DownloadOptions:
+        """The options every video this subscription queues is downloaded with."""
+        return DownloadOptions(
+            download_type=self.download_type,
+            codec=self.codec,
+            format=self.format,
+            quality=self.quality,
+            folder=self.folder or None,
+            custom_name_prefix=self.custom_name_prefix,
+            playlist_item_limit=self.playlist_item_limit,
+            auto_start=self.auto_start,
+            split_by_chapters=self.split_by_chapters,
+            chapter_template=self.chapter_template or None,
+            subtitle_language=self.subtitle_language,
+            subtitle_mode=self.subtitle_mode,
+            ytdl_options_presets=self.ytdl_options_presets,
+            ytdl_options_overrides=self.ytdl_options_overrides,
+            clip_start=self.clip_start,
+            clip_end=self.clip_end,
+            sponsorblock=self.sponsorblock,
+            audio_tags=self.audio_tags,
+        )
 
     def to_public_dict(self) -> dict:
         return {
@@ -244,6 +348,7 @@ def _subscription_to_record(sub: SubscriptionInfo) -> dict[str, Any]:
         "playlist_item_limit": sub.playlist_item_limit,
         "split_by_chapters": sub.split_by_chapters,
         "sponsorblock": sub.sponsorblock,
+        "audio_tags": sub.audio_tags,
         "chapter_template": sub.chapter_template,
         "subtitle_language": sub.subtitle_language,
         "subtitle_mode": sub.subtitle_mode,
@@ -355,6 +460,8 @@ def _coerce_bool(value: Any) -> bool:
     """Accept JSON booleans and common string forms used by API clients."""
     if isinstance(value, bool):
         return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
     if isinstance(value, str):
         lowered = value.strip().lower()
         if lowered in {"true", "1", "on"}:
@@ -407,7 +514,7 @@ class SubscriptionManager:
         return (url or "").strip()
 
     def _normalize_seen_ids(self, seen_ids: list[str]) -> list[str]:
-        max_seen = int(getattr(self.config, "SUBSCRIPTION_MAX_SEEN_IDS", 50000))
+        max_seen = self.config.SUBSCRIPTION_MAX_SEEN_IDS
         normalized = [str(sid) for sid in dict.fromkeys(seen_ids)]
         if len(normalized) > max_seen:
             normalized = normalized[:max_seen]
@@ -452,6 +559,26 @@ class SubscriptionManager:
     def _save_locked(self) -> None:
         self._store.save({"items": [_subscription_to_record(sub) for sub in self._subs.values()]})
 
+    async def _mutate(self, sub_id: str, change) -> Optional[SubscriptionInfo]:
+        """Apply *change* to a subscription and persist it, under the lock.
+
+        If the save fails the subscription is put back as it was and the error
+        propagates, so memory never runs ahead of what is on disk. Returns the
+        updated subscription, or None if it has been deleted meanwhile.
+        """
+        async with self._lock:
+            cur = self._subs.get(sub_id)
+            if cur is None:
+                return None
+            previous = copy.deepcopy(cur)
+            change(cur)
+            try:
+                self._save_locked()
+            except Exception:
+                self._subs[sub_id] = previous
+                raise
+            return cur
+
     def _scan_extra_opts(
         self,
         ytdl_options_presets: Optional[list[str]],
@@ -470,30 +597,10 @@ class SubscriptionManager:
         )
 
     async def _queue_subscription_entries(
-        self,
-        entries: list[dict],
-        *,
-        download_type: str,
-        codec: str,
-        format: str,
-        quality: str,
-        folder: str,
-        custom_name_prefix: str,
-        playlist_item_limit: int,
-        auto_start: bool,
-        split_by_chapters: bool,
-        chapter_template: str,
-        subtitle_language: str,
-        subtitle_mode: str,
-        ytdl_options_presets: Optional[list[str]] = None,
-        ytdl_options_overrides: Optional[dict[str, Any]] = None,
-        clip_start: Optional[float] = None,
-        clip_end: Optional[float] = None,
-        sponsorblock: bool = False,
+        self, entries: list[dict], options: DownloadOptions,
     ) -> tuple[list[str], list[str]]:
         queued_ids: list[str] = []
         queue_errors: list[str] = []
-        presets = list(ytdl_options_presets or [])
         for ent in entries:
             eid = _entry_id(ent)
             vurl = _entry_video_url(ent)
@@ -504,26 +611,7 @@ class SubscriptionManager:
                 queue_entry["id"] = eid
             queue_entry["_type"] = "video"
             queue_entry["webpage_url"] = vurl
-            result = await self.dqueue.add_entry(
-                queue_entry,
-                download_type,
-                codec,
-                format,
-                quality,
-                folder or None,
-                custom_name_prefix,
-                playlist_item_limit,
-                auto_start,
-                split_by_chapters,
-                chapter_template or None,
-                subtitle_language,
-                subtitle_mode,
-                presets,
-                ytdl_options_overrides,
-                clip_start,
-                clip_end,
-                sponsorblock=sponsorblock,
-            )
+            result = await self.dqueue.add_entry(queue_entry, options)
             if isinstance(result, dict) and result.get("status") == "error":
                 msg = str(result.get("msg") or f"Queueing failed for {vurl}")
                 queue_errors.append(msg)
@@ -611,6 +699,7 @@ class SubscriptionManager:
         ytdl_options_presets: Optional[list[str]] = None,
         ytdl_options_overrides: Optional[dict[str, Any]] = None,
         sponsorblock: bool = False,
+        audio_tags: str = "with_cover",
         title_regex: Any = None,
         skip_subscriber_only: Any = None,
         clip_start: Optional[float] = None,
@@ -621,8 +710,16 @@ class SubscriptionManager:
             return {"status": "error", "msg": "Missing URL"}
         # SSRF guard: block non-http(s) schemes and internal/metadata hosts
         # before yt-dlp fetches the feed. May do a DNS lookup, so run off-loop.
+        # The scan's own options pick the proxy, so a feed fetched through one
+        # is not resolved here — see validate_url.
+        proxies = download_proxies({
+            **self.config.YTDL_OPTIONS,
+            **self._scan_extra_opts(ytdl_options_presets, ytdl_options_overrides),
+        })
         url_error = await asyncio.get_running_loop().run_in_executor(
-            None, partial(validate_url, url, allow_private=getattr(self.config, "ALLOW_PRIVATE_ADDRESSES", False)))
+            None, partial(validate_url, url,
+                          allow_private=getattr(self.config, "ALLOW_PRIVATE_ADDRESSES", False),
+                          proxies=proxies))
         if url_error is not None:
             log.warning('Rejected subscription URL "%s": %s', url, url_error)
             return {"status": "error", "msg": url_error}
@@ -645,7 +742,7 @@ class SubscriptionManager:
             self._pending_urls.add(url)
 
         try:
-            scan_first = max(int(getattr(self.config, "SUBSCRIPTION_SCAN_PLAYLIST_END", 50)), 1)
+            scan_first = self.config.SUBSCRIPTION_SCAN_PLAYLIST_END
             scan_extra_opts = self._scan_extra_opts(ytdl_options_presets, ytdl_options_overrides)
             try:
                 info, entries = await asyncio.get_running_loop().run_in_executor(
@@ -695,6 +792,7 @@ class SubscriptionManager:
                 playlist_item_limit=int(playlist_item_limit),
                 split_by_chapters=bool(split_by_chapters),
                 sponsorblock=bool(sponsorblock),
+                audio_tags=audio_tags,
                 chapter_template=chapter_template or "",
                 subtitle_language=subtitle_language,
                 subtitle_mode=subtitle_mode,
@@ -801,13 +899,11 @@ class SubscriptionManager:
                 return {"status": "error", "msg": "check_interval_minutes must be an integer"}
             interval_set = True
 
-        async with self._lock:
-            sub = self._subs.get(sub_id)
-            if not sub:
-                return {"status": "error", "msg": "Subscription not found"}
-            previous = copy.deepcopy(sub)
-            old_enabled = sub.enabled
+        old_enabled = None
 
+        def apply(sub: SubscriptionInfo) -> None:
+            nonlocal old_enabled
+            old_enabled = sub.enabled
             if enabled_set:
                 sub.enabled = validated_enabled
             if interval_set:
@@ -823,12 +919,9 @@ class SubscriptionManager:
             if skip_so_set:
                 sub.skip_subscriber_only = validated_skip_so
 
-            try:
-                self._save_locked()
-            except Exception:
-                self._subs[sub_id] = previous
-                raise
-            updated = sub
+        updated = await self._mutate(sub_id, apply)
+        if updated is None:
+            return {"status": "error", "msg": "Subscription not found"}
         if "enabled" in changes and updated.enabled != old_enabled:
             log.info(
                 "Subscription %s %s",
@@ -868,9 +961,18 @@ class SubscriptionManager:
             async with self._lock:
                 self._checks_in_flight.discard(sid)
 
+    async def _record_check(self, sub_id: str, *, error: Optional[str], seen_ids=None) -> Optional[SubscriptionInfo]:
+        """Persist the outcome of a check: when it ran, its error, and the ids it saw."""
+        def apply(sub: SubscriptionInfo) -> None:
+            sub.last_checked = time.time()
+            sub.error = error
+            if seen_ids is not None:
+                sub.seen_ids = seen_ids
+        return await self._mutate(sub_id, apply)
+
     async def _check_one_inner(self, sub: SubscriptionInfo) -> None:
         sid = sub.id
-        scan = int(getattr(self.config, "SUBSCRIPTION_SCAN_PLAYLIST_END", 50))
+        scan = self.config.SUBSCRIPTION_SCAN_PLAYLIST_END
         # ytdl_options_presets/overrides are set at subscription creation and
         # never mutated afterwards (update_subscription doesn't allow it), so
         # reading them off `sub` here without holding the lock is safe.
@@ -882,18 +984,7 @@ class SubscriptionManager:
                 partial(extract_flat_playlist, self.config, sub.url, scan, extra_opts=scan_extra_opts),
             )
         except yt_dlp.utils.YoutubeDLError as exc:
-            async with self._lock:
-                cur = self._subs.get(sid)
-                if cur:
-                    previous = copy.deepcopy(cur)
-                    cur.error = str(exc)
-                    cur.last_checked = time.time()
-                    try:
-                        self._save_locked()
-                    except Exception:
-                        self._subs[sid] = previous
-                        raise
-                    sub = cur
+            sub = await self._record_check(sid, error=str(exc)) or sub
             log.warning("Subscription check failed for %s: %s", sub.name, exc)
             await self.notifier.subscription_updated(sub)
             return
@@ -901,34 +992,12 @@ class SubscriptionManager:
 
         etype = (info or {}).get("_type") or "video"
         if etype == "video":
-            async with self._lock:
-                cur = self._subs.get(sid)
-                if cur:
-                    previous = copy.deepcopy(cur)
-                    cur.error = VIDEO_ONLY_MSG
-                    cur.last_checked = time.time()
-                    try:
-                        self._save_locked()
-                    except Exception:
-                        self._subs[sid] = previous
-                        raise
-                    sub = cur
+            sub = await self._record_check(sid, error=VIDEO_ONLY_MSG) or sub
             log.warning("Subscription %s no longer resolves to a subscribable feed", sub.name)
             await self.notifier.subscription_updated(sub)
             return
         if not entries:
-            async with self._lock:
-                cur = self._subs.get(sid)
-                if cur:
-                    previous = copy.deepcopy(cur)
-                    cur.last_checked = time.time()
-                    cur.error = None
-                    try:
-                        self._save_locked()
-                    except Exception:
-                        self._subs[sid] = previous
-                        raise
-                    sub = cur
+            sub = await self._record_check(sid, error=None) or sub
             log.warning("Subscription check finished for %s: No entries found", sub.name)
             await self.notifier.subscription_updated(sub)
             return
@@ -939,25 +1008,11 @@ class SubscriptionManager:
                 return
             seen = cur.seen_set()
             seen_ids_snapshot = list(cur.seen_ids)
-            dl_type = cur.download_type
-            dl_codec = cur.codec
-            dl_format = cur.format
-            dl_quality = cur.quality
-            dl_folder = cur.folder
-            dl_prefix = cur.custom_name_prefix
-            dl_plimit = cur.playlist_item_limit
-            dl_autostart = cur.auto_start
-            dl_split = cur.split_by_chapters
-            dl_sponsorblock = cur.sponsorblock
-            dl_chapter = cur.chapter_template
-            dl_sublang = cur.subtitle_language
-            dl_submode = cur.subtitle_mode
-            dl_ytdl_presets = list(cur.ytdl_options_presets)
-            dl_ytdl_overrides = dict(cur.ytdl_options_overrides)
+            # A snapshot: the queueing below runs without the lock, and an
+            # edit made meanwhile applies from the next check on.
+            options = cur.download_options()
             dl_title_regex = cur.title_regex or ""
             dl_skip_subscriber_only = bool(cur.skip_subscriber_only)
-            dl_clip_start = cur.clip_start
-            dl_clip_end = cur.clip_end
 
         new_entries: list[dict] = []
         for ent in entries:
@@ -1006,26 +1061,7 @@ class SubscriptionManager:
                 kept_entries.append(ent)
             queue_entries = kept_entries
 
-        queued_ids, queue_errors = await self._queue_subscription_entries(
-            queue_entries,
-            download_type=dl_type,
-            codec=dl_codec,
-            format=dl_format,
-            quality=dl_quality,
-            folder=dl_folder,
-            custom_name_prefix=dl_prefix,
-            playlist_item_limit=dl_plimit,
-            auto_start=dl_autostart,
-            split_by_chapters=dl_split,
-            sponsorblock=dl_sponsorblock,
-            chapter_template=dl_chapter or "",
-            subtitle_language=dl_sublang,
-            subtitle_mode=dl_submode,
-            ytdl_options_presets=dl_ytdl_presets,
-            ytdl_options_overrides=dl_ytdl_overrides,
-            clip_start=dl_clip_start,
-            clip_end=dl_clip_end,
-        )
+        queued_ids, queue_errors = await self._queue_subscription_entries(queue_entries, options)
         log.info(
             "Subscription check finished for %s: %d new, %d filtered, %d subscriber_skipped, %d queued, %d failed",
             sub.name,
@@ -1041,24 +1077,14 @@ class SubscriptionManager:
                 queued_ids + filtered_ids + subscriber_filtered_ids + seen_ids_snapshot
             )
         )
-        max_seen = int(getattr(self.config, "SUBSCRIPTION_MAX_SEEN_IDS", 50000))
+        max_seen = self.config.SUBSCRIPTION_MAX_SEEN_IDS
         if len(merged) > max_seen:
             merged = merged[:max_seen]
 
-        async with self._lock:
-            cur = self._subs.get(sid)
-            if not cur:
-                return
-            previous = copy.deepcopy(cur)
-            cur.seen_ids = merged
-            cur.last_checked = time.time()
-            cur.error = "; ".join(queue_errors[:3]) if queue_errors else None
-            try:
-                self._save_locked()
-            except Exception:
-                self._subs[sid] = previous
-                raise
-            sub = cur
+        error = "; ".join(list(dict.fromkeys(queue_errors))[:3]) if queue_errors else None
+        sub = await self._record_check(sid, error=error, seen_ids=merged)
+        if sub is None:
+            return
         await self.notifier.subscription_updated(sub)
 
     async def emit_all(self) -> None:

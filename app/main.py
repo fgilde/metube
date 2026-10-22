@@ -11,7 +11,6 @@ from aiohttp.web import GracefulExit
 from aiohttp.log import access_logger
 import ssl
 import hmac
-import socket
 import socketio
 import logging
 import json
@@ -22,15 +21,18 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
-from watchfiles import DefaultFilter, Change, awatch
+from watchfiles import awatch
 
 import auth
 import bg_tasks
+import auth
 import direct
+import format_catalog
 from state_store import AtomicJsonStore
 from url_guard import validate_url
 from ytdl import DownloadQueueNotifier, DownloadQueue, Download, _MP_CTX
-from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, coerce_optional_bool
+from download_options import DownloadOptions
+from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, browse_playlist, coerce_optional_bool
 from yt_dlp.version import __version__ as yt_dlp_version
 
 log = logging.getLogger('main')
@@ -51,10 +53,24 @@ def seconds_until_next_daily_time(time_hhmm: str, now: datetime | None = None) -
         target += timedelta(days=1)
     return (target - now).total_seconds()
 
+# LOGLEVEL=NONE is documented to turn logging off; a level above CRITICAL
+# drops every record.
+_LOG_LEVEL_NONE = logging.CRITICAL + 10
+
+
 def parseLogLevel(logLevel):
+    """The numeric level for a LOGLEVEL name, or None if it is not one.
+
+    Only real level names count: a bare getattr on the logging module would
+    also "resolve" attribute names such as BASIC_FORMAT.
+    """
     if not isinstance(logLevel, str):
         return None
-    return getattr(logging, logLevel.upper(), None)
+    name = logLevel.strip().upper()
+    if name == 'NONE':
+        return _LOG_LEVEL_NONE
+    level = logging.getLevelNamesMapping().get(name)
+    return level if isinstance(level, int) and name != 'NOTSET' else None
 
 # Configure logging before Config() uses it so early messages are not dropped.
 # Only configure if no handlers are set (avoid clobbering hosting app settings).
@@ -110,7 +126,7 @@ class Config:
         'DIRECT_ROUTES_KEY': '',
     }
 
-    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'DELETE_FILE_ON_TRASHCAN', 'HTTPS', 'ENABLE_ACCESSLOG', 'ALLOW_YTDL_OPTIONS_OVERRIDES', 'ALLOW_PRIVATE_ADDRESSES', 'DIRECT_ROUTES')
+    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'HTTPS', 'ENABLE_ACCESSLOG', 'ALLOW_YTDL_OPTIONS_OVERRIDES', 'ALLOW_PRIVATE_ADDRESSES', 'DIRECT_ROUTES')
 
     def __init__(self):
         for k, v in self._DEFAULTS.items():
@@ -124,6 +140,21 @@ class Config:
                     log.error(f'Environment variable "{k}" is set to a non-boolean value "{v}"')
                     sys.exit(1)
                 setattr(self, k, v in ('true', 'True', 'on', '1'))
+
+        # DELETE_FILE_ON_TRASHCAN is a tri-state, not a plain boolean: 'ask' defers
+        # the decision to the user at delete time (see the /delete route), while
+        # 'true'/'false' keep the historical always/never behavior. Normalize the
+        # existing boolean spellings plus 'ask' to one of these three strings.
+        raw = self.DELETE_FILE_ON_TRASHCAN.strip()
+        if raw in ('true', 'True', 'on', '1'):
+            self.DELETE_FILE_ON_TRASHCAN = 'true'
+        elif raw in ('false', 'False', 'off', '0'):
+            self.DELETE_FILE_ON_TRASHCAN = 'false'
+        elif raw.lower() == 'ask':
+            self.DELETE_FILE_ON_TRASHCAN = 'ask'
+        else:
+            log.error(f'Environment variable "DELETE_FILE_ON_TRASHCAN" is set to an invalid value "{raw}", expected one of "true", "false", "ask"')
+            sys.exit(1)
 
         # aiohttp hands HOST straight to getaddrinfo, which has no notion of a
         # '*' wildcard: the lookup fails and takes the server down at startup
@@ -193,6 +224,38 @@ class Config:
             )
             sys.exit(1)
 
+        # A variable set blank in a compose file means "use the default".
+        for attr in ('LOGLEVEL', 'DEFAULT_THEME'):
+            if not getattr(self, attr).strip():
+                setattr(self, attr, self._DEFAULTS[attr])
+
+        if parseLogLevel(self.LOGLEVEL) is None:
+            log.error(
+                'Environment variable "LOGLEVEL" must be one of DEBUG, INFO, WARNING, ERROR, '
+                'CRITICAL or NONE, got "%s"', self.LOGLEVEL)
+            sys.exit(1)
+
+        # The theme cookie is matched against the UI's theme ids as-is.
+        self.DEFAULT_THEME = self.DEFAULT_THEME.strip().lower()
+        if self.DEFAULT_THEME not in ('light', 'dark', 'auto'):
+            log.error(
+                'Environment variable "DEFAULT_THEME" must be one of light, dark or auto, got "%s"',
+                self.DEFAULT_THEME)
+            sys.exit(1)
+
+        # Compiled once here: get_custom_dirs() runs inside every Socket.IO
+        # connect, where a bad pattern used to raise on each one and leave the
+        # client without its folder list.
+        try:
+            self.CUSTOM_DIRS_EXCLUDE_RE = (
+                re.compile(self.CUSTOM_DIRS_EXCLUDE_REGEX) if self.CUSTOM_DIRS_EXCLUDE_REGEX else None
+            )
+        except re.error as exc:
+            log.error(
+                'Environment variable "CUSTOM_DIRS_EXCLUDE_REGEX" is not a valid regular expression '
+                '("%s"): %s', self.CUSTOM_DIRS_EXCLUDE_REGEX, exc)
+            sys.exit(1)
+
         self._validate_int('MAX_CONCURRENT_DOWNLOADS', minimum=1)
         self._validate_int('PORT', minimum=1, maximum=65535)
         self._validate_int('CLEAR_COMPLETED_AFTER', minimum=0)
@@ -211,6 +274,8 @@ class Config:
             sys.exit(1)
 
     def _validate_int(self, key, *, minimum=None, maximum=None):
+        """Check an integer setting and store it as an int, so nothing
+        downstream has to convert (or re-validate) it."""
         raw = getattr(self, key)
         try:
             value = int(raw)
@@ -223,6 +288,7 @@ class Config:
         if maximum is not None and value > maximum:
             log.error('Environment variable "%s" must be <= %d, got "%s"', key, maximum, raw)
             sys.exit(1)
+        setattr(self, key, value)
 
     def set_runtime_override(self, key, value):
         self._runtime_overrides[key] = value
@@ -247,6 +313,7 @@ class Config:
         'DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT',
         'SUBSCRIPTION_DEFAULT_CHECK_INTERVAL',
         'ALLOW_YTDL_OPTIONS_OVERRIDES',
+        'DELETE_FILE_ON_TRASHCAN',
     )
 
     def frontend_safe(self) -> dict:
@@ -257,9 +324,16 @@ class Config:
         """
         return {k: getattr(self, k) for k in self._FRONTEND_KEYS}
 
+    def _env_json(self, key: str):
+        """The JSON in an environment variable, parsed afresh (a reload reads the
+        environment again, since the attribute holds the parsed value). Unset or
+        blank -- as a compose file often leaves it -- means the default."""
+        raw = os.environ.get(key, '').strip() or self._DEFAULTS[key]
+        return json.loads(raw)
+
     def load_ytdl_options(self) -> tuple[bool, str]:
         try:
-            self.YTDL_OPTIONS = json.loads(os.environ.get('YTDL_OPTIONS', '{}'))
+            self.YTDL_OPTIONS = self._env_json('YTDL_OPTIONS')
             assert isinstance(self.YTDL_OPTIONS, dict)
         except (json.decoder.JSONDecodeError, AssertionError):
             msg = 'Environment variable YTDL_OPTIONS is invalid'
@@ -290,7 +364,7 @@ class Config:
 
     def load_ytdl_option_presets(self) -> tuple[bool, str]:
         try:
-            self.YTDL_OPTIONS_PRESETS = json.loads(os.environ.get('YTDL_OPTIONS_PRESETS', '{}'))
+            self.YTDL_OPTIONS_PRESETS = self._env_json('YTDL_OPTIONS_PRESETS')
             assert isinstance(self.YTDL_OPTIONS_PRESETS, dict)
             assert all(isinstance(name, str) and isinstance(options, dict) for name, options in self.YTDL_OPTIONS_PRESETS.items())
         except (json.decoder.JSONDecodeError, AssertionError):
@@ -450,7 +524,110 @@ def _require_admin(request) -> None:
         raise web.HTTPForbidden(text='admin only')
 
 
-app = web.Application(middlewares=[auth_guard, state_dir_guard])
+def _origin_is_trusted(origin, sec_fetch_site, hosts) -> bool:
+    """Whether a browser request from *origin* may act on this instance.
+
+    CORS only decides whether a page may *read* a response. A browser still
+    sends a cross-site text/plain or multipart POST without a preflight, with
+    whatever credentials it holds for MeTube (a reverse proxy's login cookie,
+    cached basic auth), and on an instance without auth any page the user
+    visits can reach it over the LAN. So the origin has to be checked before
+    the request acts, not after.
+
+    Passes MeTube's own UI (same-origin), the origins named in
+    CORS_ALLOWED_ORIGINS, and everything under the '*' wildcard, which is the
+    operator letting every site in. A request carrying neither Origin nor
+    Sec-Fetch-Site is not from a browser page (curl, the iOS shortcut, Raycast)
+    and passes too: a forged request needs a victim's browser. Modelled on Go's
+    net/http CrossOriginProtection.
+    """
+    if origin and ('*' in _cors_origins or origin in _cors_origins):
+        return True
+    if sec_fetch_site:
+        # It answers the question directly and, unlike comparing Origin with
+        # Host, survives a reverse proxy that rewrites Host. But browsers send
+        # it only to secure origins (HTTPS or localhost), so a plain-HTTP
+        # instance on a LAN address never gets it. 'none' is a user-initiated
+        # request, such as one typed into the address bar.
+        return sec_fetch_site in ('same-origin', 'none')
+    if not origin:
+        return True
+    # Plain HTTP or an older browser: compare Origin with the host the request
+    # was addressed to. X-Forwarded-Host is safe to accept here, since a page
+    # cannot set it on a cross-origin request without a preflight. A proxy that
+    # rewrites Host and sends no X-Forwarded-Host (nginx's `Host $host` drops
+    # the port) makes MeTube's own UI look cross-origin; see _log_refusal.
+    try:
+        netloc = urlparse(origin).netloc.lower()
+    except ValueError:
+        return False
+    return bool(netloc) and any(h and h.split(',')[0].strip().lower() == netloc for h in hosts)
+
+
+_SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS')
+
+
+def _log_refusal(what, origin, sec_fetch_site, hosts):
+    if sec_fetch_site:
+        # The browser itself said the request came from another site.
+        log.warning(
+            'Refused cross-origin %s from %s. If this is a bookmarklet or extension you use, '
+            'add its origin to CORS_ALLOWED_ORIGINS.', what, origin)
+        return
+    host, forwarded_host = hosts
+    log.warning(
+        'Refused cross-origin %s from %s: it was addressed to Host %s%s. If %s is where you '
+        'open MeTube, a reverse proxy in front of it is rewriting the Host header; have it '
+        'pass the original one (in nginx: proxy_set_header Host $http_host), or add that '
+        'address to CORS_ALLOWED_ORIGINS. If it is a bookmarklet or extension you use, add '
+        'its origin to CORS_ALLOWED_ORIGINS.',
+        what, origin, host, f' (X-Forwarded-Host {forwarded_host})' if forwarded_host else '', origin)
+
+
+@web.middleware
+async def cross_origin_guard(request, handler):
+    if request.method not in _SAFE_METHODS:
+        origin = request.headers.get('Origin')
+        hosts = (request.headers.get('Host'), request.headers.get('X-Forwarded-Host'))
+        sec_fetch_site = request.headers.get('Sec-Fetch-Site')
+        if not _origin_is_trusted(origin, sec_fetch_site, hosts):
+            _log_refusal(f'{request.method} {request.path}', origin, sec_fetch_site, hosts)
+            # Make the refusal itself readable to the page that sent it. A
+            # bookmarklet whose site is not listed would otherwise see only a
+            # network error, indistinguishable from MeTube being down, and
+            # bookmarklets written before this check was added show nothing
+            # at all on one. The body names nothing but the page's own origin,
+            # so the page learns only that it was refused.
+            headers = {}
+            if origin:
+                headers = {
+                    'Access-Control-Allow-Origin': origin,
+                    'Access-Control-Allow-Credentials': 'true',
+                    'Vary': 'Origin',
+                }
+            raise web.HTTPForbidden(
+                reason='Cross-origin request not allowed', headers=headers,
+                text=f'MeTube refused this request from {origin}. '
+                     'Add that origin to CORS_ALLOWED_ORIGINS to allow it.')
+    return await handler(request)
+
+
+def _socketio_origin_allowed(origin, environ):
+    # Browsers apply no CORS to WebSockets, so this check is all that stops a
+    # page on another site from connecting and reading the queue, history and
+    # configuration the connect handler sends.
+    hosts = (environ.get('HTTP_HOST'), environ.get('HTTP_X_FORWARDED_HOST'))
+    sec_fetch_site = environ.get('HTTP_SEC_FETCH_SITE')
+    if _origin_is_trusted(origin, sec_fetch_site, hosts):
+        return True
+    # engine.io asks again while building the refusal response; log once.
+    if not environ.get('metube.origin_refusal_logged'):
+        environ['metube.origin_refusal_logged'] = True
+        _log_refusal('Socket.IO connection', origin, sec_fetch_site, hosts)
+    return False
+
+
+app = web.Application(middlewares=[cross_origin_guard, auth_guard, state_dir_guard])
 _cors_origins = [o.strip() for o in config.CORS_ALLOWED_ORIGINS.split(',') if o.strip()] if config.CORS_ALLOWED_ORIGINS else []
 if '*' in _cors_origins and len(_cors_origins) > 1:
     log.warning(
@@ -458,17 +635,9 @@ if '*' in _cors_origins and len(_cors_origins) > 1:
         "cross-origin requests stay disabled for every origin in the list. Remove '*' if you "
         "need a bookmarklet to reach an authenticated instance.",
         [o for o in _cors_origins if o != '*'])
-sio = socketio.AsyncServer(cors_allowed_origins=_cors_origins if _cors_origins else [])
+sio = socketio.AsyncServer(cors_allowed_origins=_socketio_origin_allowed)
 sio.attach(app, socketio_path=config.URL_PREFIX + 'socket.io')
 routes = web.RouteTableDef()
-VALID_SUBTITLE_FORMATS = {'srt', 'txt', 'vtt', 'ttml', 'sbv', 'scc', 'dfxp'}
-VALID_SUBTITLE_MODES = {'auto_only', 'manual_only', 'prefer_manual', 'prefer_auto'}
-SUBTITLE_LANGUAGE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]{0,34}$')
-VALID_DOWNLOAD_TYPES = {'video', 'audio', 'captions', 'thumbnail'}
-VALID_VIDEO_CODECS = {'auto', 'h264', 'h265', 'av1', 'vp9'}
-VALID_VIDEO_FORMATS = {'any', 'mp4', 'ios'}
-VALID_AUDIO_FORMATS = {'m4a', 'mp3', 'opus', 'wav', 'flac'}
-VALID_THUMBNAIL_FORMATS = {'jpg'}
 def _parse_ytdl_options_overrides(value, *, enabled: bool) -> dict:
     if value is None or value == '':
         return {}
@@ -622,6 +791,12 @@ def _parse_ytdl_options_presets(post: dict) -> list[str]:
     )
 
 
+def _require_configured_presets(names: list[str]) -> None:
+    for preset_name in names:
+        if preset_name not in config.YTDL_OPTIONS_PRESETS:
+            raise web.HTTPBadRequest(reason='ytdl_options_presets must only contain configured preset names')
+
+
 def _migrate_legacy_request(post: dict) -> dict:
     """
     BACKWARD COMPATIBILITY: Translate old API request schema into the new one.
@@ -645,7 +820,8 @@ def _migrate_legacy_request(post: dict) -> dict:
     old_quality = str(post.get("quality") or "best").strip().lower()
     old_video_codec = str(post.get("video_codec") or "auto").strip().lower()
 
-    if old_format in VALID_AUDIO_FORMATS:
+    # 'auto' postdates the legacy API, where it never named an audio format.
+    if old_format in format_catalog.format_ids('audio') and old_format != 'auto':
         post["download_type"] = "audio"
         post["codec"] = "auto"
         post["format"] = old_format
@@ -768,25 +944,6 @@ async def _start_nightly_update_schedule(app):
 
 app.on_startup.append(_start_nightly_update_schedule)
 
-class FileOpsFilter(DefaultFilter):
-    def __call__(self, change_type: int, path: str) -> bool:
-        # Check if this path matches our YTDL_OPTIONS_FILE
-        if path != config.YTDL_OPTIONS_FILE:
-            return False
-
-        # For existing files, use samefile comparison to handle symlinks correctly
-        if os.path.exists(config.YTDL_OPTIONS_FILE):
-            try:
-                if not os.path.samefile(path, config.YTDL_OPTIONS_FILE):
-                    return False
-            except (OSError, IOError):
-                # If samefile fails, fall back to string comparison
-                if path != config.YTDL_OPTIONS_FILE:
-                    return False
-
-        # Accept all change types for our file: modified, added, deleted
-        return change_type in (Change.modified, Change.added, Change.deleted)
-
 def get_options_update_time(success=True, msg=''):
     result = {
         'success': success,
@@ -804,15 +961,49 @@ def get_options_update_time(success=True, msg=''):
 
     return result
 
-async def watch_files():
-    async def _watch_files():
-        async for changes in awatch(config.YTDL_OPTIONS_FILE, watch_filter=FileOpsFilter()):
-            success, msg = config.load_ytdl_options()
-            result = get_options_update_time(success, msg)
-            await sio.emit('ytdl_options_changed', serializer.encode(result))
 
+def _options_file_signature(path: str):
+    """What identifies one version of the options file, or None if it is gone.
+
+    os.stat follows symlinks, so this sees through a Kubernetes ConfigMap mount,
+    where the visible file is a symlink whose target is swapped on update.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+async def _watch_options_file(on_change, *, debounce: int = 1600, stop_event=None) -> None:
+    """Call *on_change* whenever YTDL_OPTIONS_FILE changes.
+
+    Watches the file's directory, not the file. A watch on the file itself is
+    tied to its inode, and editors, `sed -i` and config tools save by writing a
+    new file and renaming it over the old one: the first such save was seen
+    and every change after it was not. Non-recursive, so an options file kept
+    in the download directory does not put a watch on the whole library.
+    """
+    path = os.path.abspath(config.YTDL_OPTIONS_FILE)
+    last = _options_file_signature(path)
+    async for _changes in awatch(
+        os.path.dirname(path), recursive=False, debounce=debounce, stop_event=stop_event,
+    ):
+        current = _options_file_signature(path)
+        if current == last:
+            continue
+        last = current
+        await on_change()
+
+
+async def _reload_ytdl_options() -> None:
+    success, msg = config.load_ytdl_options()
+    await sio.emit('ytdl_options_changed', serializer.encode(get_options_update_time(success, msg)))
+
+
+async def watch_files():
     log.info(f'Starting Watch File: {config.YTDL_OPTIONS_FILE}')
-    bg_tasks.create_task(_watch_files(), name="watch_ytdl_options_file")
+    bg_tasks.create_task(_watch_options_file(_reload_ytdl_options), name="watch_ytdl_options_file")
 
 async def _watch_files_startup(app):
     await watch_files()
@@ -832,8 +1023,47 @@ async def _read_json_request(request: web.Request) -> dict:
     return post
 
 
-def parse_download_options(post: dict) -> dict:
-    """Validate add/subscribe body; raise HTTPBadRequest on invalid input."""
+def _bool_field(post: dict, key: str, default: bool) -> bool:
+    """A boolean body field, also accepting the string and 0/1 spellings API
+    clients send. Absent, null or blank takes *default*; anything else that is
+    not a boolean is refused rather than read as truthy."""
+    value = post.get(key)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    try:
+        return coerce_optional_bool(value, default=default, field_name=key)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(reason=str(exc)) from exc
+
+
+def _str_field(post: dict, key: str, default):
+    """A string body field: absent or null takes *default*, a non-string is refused."""
+    value = post.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise web.HTTPBadRequest(reason=f"'{key}' must be a string")
+    return value
+
+
+def _playlist_item_limit_field(post: dict) -> int:
+    value = post.get('playlist_item_limit')
+    if value is None:
+        value = config.DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT
+    if isinstance(value, bool):
+        raise web.HTTPBadRequest(reason='playlist_item_limit must be an integer')
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise web.HTTPBadRequest(reason='playlist_item_limit must be an integer') from exc
+    if value < 0:
+        raise web.HTTPBadRequest(reason='playlist_item_limit must not be negative')
+    return value
+
+
+def parse_download_options(post: dict) -> tuple[str, DownloadOptions]:
+    """Validate an add/subscribe body into its URL and options; raise
+    HTTPBadRequest on invalid input."""
     post = _migrate_legacy_request(dict(post))
     url = post.get('url')
     download_type = post.get('download_type')
@@ -843,33 +1073,25 @@ def parse_download_options(post: dict) -> dict:
     if not url or not quality or not download_type:
         raise web.HTTPBadRequest(reason="missing 'url', 'download_type', or 'quality'")
     url = str(url).strip()
-    folder = post.get('folder')
-    custom_name_prefix = post.get('custom_name_prefix')
-    playlist_item_limit = post.get('playlist_item_limit')
-    auto_start = post.get('auto_start')
-    split_by_chapters = post.get('split_by_chapters')
-    sponsorblock = bool(post.get('sponsorblock'))
-    chapter_template = post.get('chapter_template')
+    folder = _str_field(post, 'folder', None)
+    custom_name_prefix = _str_field(post, 'custom_name_prefix', '')
+    playlist_item_limit = _playlist_item_limit_field(post)
+    auto_start = _bool_field(post, 'auto_start', True)
+    split_by_chapters = _bool_field(post, 'split_by_chapters', False)
+    sponsorblock = _bool_field(post, 'sponsorblock', False)
+    audio_tags = str(post.get('audio_tags') or format_catalog.choice_default('audio', 'audio_tags')).strip().lower()
+    chapter_template = _str_field(post, 'chapter_template', config.OUTPUT_TEMPLATE_CHAPTER)
     subtitle_language = post.get('subtitle_language')
     subtitle_mode = post.get('subtitle_mode')
     ytdl_options_overrides = post.get('ytdl_options_overrides')
+    video_password = post.get('video_password')
 
-    if custom_name_prefix is None:
-        custom_name_prefix = ''
-    if auto_start is None:
-        auto_start = True
-    if playlist_item_limit is None:
-        playlist_item_limit = config.DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT
-    if split_by_chapters is None:
-        split_by_chapters = False
-    if chapter_template is None:
-        chapter_template = config.OUTPUT_TEMPLATE_CHAPTER
     if subtitle_language is None:
-        subtitle_language = 'en'
+        subtitle_language = format_catalog.choice_default('captions', 'subtitle_language')
     if subtitle_mode is None:
-        subtitle_mode = 'prefer_manual'
+        subtitle_mode = format_catalog.choice_default('captions', 'subtitle_mode')
     download_type = str(download_type).strip().lower()
-    codec = str(codec or 'auto').strip().lower()
+    codec = str(codec or format_catalog.choice_default('video', 'codec')).strip().lower()
     format = str(format or '').strip().lower()
     quality = str(quality).strip().lower()
     subtitle_language = str(subtitle_language).strip()
@@ -879,51 +1101,21 @@ def parse_download_options(post: dict) -> dict:
         ytdl_options_overrides,
         enabled=config.ALLOW_YTDL_OPTIONS_OVERRIDES,
     )
+    # Not stripped: passwords may legitimately contain leading/trailing spaces.
+    if video_password == '':
+        video_password = None
+    if video_password is not None and not isinstance(video_password, str):
+        raise web.HTTPBadRequest(reason='video_password must be a string')
 
-    if not SUBTITLE_LANGUAGE_RE.fullmatch(subtitle_language):
-        raise web.HTTPBadRequest(reason='subtitle_language must match pattern [A-Za-z0-9-] and be at most 35 characters')
-    if subtitle_mode not in VALID_SUBTITLE_MODES:
-        raise web.HTTPBadRequest(reason=f'subtitle_mode must be one of {sorted(VALID_SUBTITLE_MODES)}')
-    for preset_name in ytdl_options_presets:
-        if preset_name not in config.YTDL_OPTIONS_PRESETS:
-            raise web.HTTPBadRequest(reason='ytdl_options_presets must only contain configured preset names')
-
-    if download_type not in VALID_DOWNLOAD_TYPES:
-        raise web.HTTPBadRequest(reason=f'download_type must be one of {sorted(VALID_DOWNLOAD_TYPES)}')
-    if codec not in VALID_VIDEO_CODECS:
-        raise web.HTTPBadRequest(reason=f'codec must be one of {sorted(VALID_VIDEO_CODECS)}')
-
-    if download_type == 'video':
-        if format not in VALID_VIDEO_FORMATS:
-            raise web.HTTPBadRequest(reason=f'format must be one of {sorted(VALID_VIDEO_FORMATS)} for video')
-        if quality not in {'best', 'worst', '2160', '1440', '1080', '720', '480', '360', '240'}:
-            raise web.HTTPBadRequest(reason="quality must be one of ['best', '2160', '1440', '1080', '720', '480', '360', '240', 'worst'] for video")
-    elif download_type == 'audio':
-        if format not in VALID_AUDIO_FORMATS:
-            raise web.HTTPBadRequest(reason=f'format must be one of {sorted(VALID_AUDIO_FORMATS)} for audio')
-        allowed_audio_qualities = {'best'}
-        if format == 'mp3':
-            allowed_audio_qualities |= {'320', '192', '128'}
-        elif format == 'm4a':
-            allowed_audio_qualities |= {'192', '128'}
-        if quality not in allowed_audio_qualities:
-            raise web.HTTPBadRequest(reason=f'quality must be one of {sorted(allowed_audio_qualities)} for format {format}')
-        codec = 'auto'
-    elif download_type == 'captions':
-        if format not in VALID_SUBTITLE_FORMATS:
-            raise web.HTTPBadRequest(reason=f'format must be one of {sorted(VALID_SUBTITLE_FORMATS)} for captions')
-        quality = 'best'
-        codec = 'auto'
-    elif download_type == 'thumbnail':
-        if format not in VALID_THUMBNAIL_FORMATS:
-            raise web.HTTPBadRequest(reason=f'format must be one of {sorted(VALID_THUMBNAIL_FORMATS)} for thumbnail')
-        quality = 'best'
-        codec = 'auto'
+    _require_configured_presets(ytdl_options_presets)
 
     try:
-        playlist_item_limit = int(playlist_item_limit)
-    except (TypeError, ValueError) as exc:
-        raise web.HTTPBadRequest(reason='playlist_item_limit must be an integer') from exc
+        format_catalog.check_subtitle_language(subtitle_language)
+        format_catalog.check_subtitle_mode(subtitle_mode)
+        format_catalog.check_audio_tags(audio_tags)
+        codec, format, quality = format_catalog.resolve_selection(download_type, codec, format, quality)
+    except format_catalog.InvalidOption as exc:
+        raise web.HTTPBadRequest(reason=str(exc)) from exc
 
     clip_start_raw = post.get('clip_start')
     clip_end_raw = post.get('clip_end')
@@ -958,26 +1150,27 @@ def parse_download_options(post: dict) -> dict:
         if clip_start is not None and clip_end is not None and clip_end <= clip_start:
             raise web.HTTPBadRequest(reason='clip_end must be greater than clip_start')
 
-    return {
-        'url': url,
-        'download_type': download_type,
-        'codec': codec,
-        'format': format,
-        'quality': quality,
-        'folder': folder,
-        'custom_name_prefix': custom_name_prefix,
-        'playlist_item_limit': playlist_item_limit,
-        'auto_start': auto_start,
-        'split_by_chapters': split_by_chapters,
-        'sponsorblock': sponsorblock,
-        'chapter_template': chapter_template,
-        'subtitle_language': subtitle_language,
-        'subtitle_mode': subtitle_mode,
-        'ytdl_options_presets': ytdl_options_presets,
-        'ytdl_options_overrides': ytdl_options_overrides,
-        'clip_start': clip_start,
-        'clip_end': clip_end,
-    }
+    return url, DownloadOptions(
+        download_type=download_type,
+        codec=codec,
+        format=format,
+        quality=quality,
+        folder=folder,
+        custom_name_prefix=custom_name_prefix,
+        playlist_item_limit=playlist_item_limit,
+        auto_start=auto_start,
+        split_by_chapters=split_by_chapters,
+        sponsorblock=sponsorblock,
+        audio_tags=audio_tags,
+        chapter_template=chapter_template,
+        subtitle_language=subtitle_language,
+        subtitle_mode=subtitle_mode,
+        ytdl_options_presets=ytdl_options_presets,
+        ytdl_options_overrides=ytdl_options_overrides,
+        clip_start=clip_start,
+        clip_end=clip_end,
+        video_password=video_password,
+    )
 
 
 @routes.post(config.URL_PREFIX + 'add')
@@ -985,37 +1178,47 @@ async def add(request):
     log.info("Received request to add download")
     post = await _read_json_request(request)
     try:
-        o = parse_download_options(post)
+        url, options = parse_download_options(post)
     except web.HTTPBadRequest as e:
         log.error("Bad request: %s", e.reason)
         raise
     log.info(
         "Add download request: type=%s quality=%s format=%s has_folder=%s auto_start=%s",
-        o['download_type'],
-        o['quality'],
-        o['format'],
-        bool(o.get('folder')),
-        o['auto_start'],
+        options.download_type,
+        options.quality,
+        options.format,
+        bool(options.folder),
+        options.auto_start,
     )
-    status = await dqueue.add(
-        o['url'],
-        o['download_type'],
-        o['codec'],
-        o['format'],
-        o['quality'],
-        o['folder'],
-        o['custom_name_prefix'],
-        o['playlist_item_limit'],
-        o['auto_start'],
-        o['split_by_chapters'],
-        o['chapter_template'],
-        o['subtitle_language'],
-        o['subtitle_mode'],
-        o['ytdl_options_presets'],
-        o['ytdl_options_overrides'],
-        o['clip_start'],
-        o['clip_end'],
-        sponsorblock=o['sponsorblock'],
+    status = await dqueue.add(url, options)
+    return web.Response(text=serializer.encode(status))
+
+
+@routes.get(config.URL_PREFIX + 'formats')
+async def formats(request):
+    """The download options /add accepts, with labels; see format_catalog."""
+    return web.Response(
+        text=serializer.encode(format_catalog.public_catalog()),
+        content_type='application/json',
+    )
+
+@routes.post(config.URL_PREFIX + 'browse')
+async def browse(request):
+    """Flat-probe a playlist/channel URL and list its entries; queues nothing."""
+    post = await _read_json_request(request)
+    url = str(post.get('url') or '').strip()
+    if not url:
+        raise web.HTTPBadRequest(reason="missing 'url'")
+    ytdl_options_presets = _parse_ytdl_options_presets(post)
+    _require_configured_presets(ytdl_options_presets)
+    ytdl_options_overrides = _parse_ytdl_options_overrides(
+        post.get('ytdl_options_overrides'),
+        enabled=config.ALLOW_YTDL_OPTIONS_OVERRIDES,
+    )
+    playlist_item_limit = _playlist_item_limit_field(post)
+    log.info("Received request to browse playlist (item limit %s)", playlist_item_limit)
+    status = await browse_playlist(
+        config, url, playlist_item_limit, ytdl_options_presets, ytdl_options_overrides
     )
     return web.Response(text=serializer.encode(status))
 
@@ -1047,7 +1250,7 @@ async def retry(request):
 @routes.post(config.URL_PREFIX + 'subscribe')
 async def subscribe(request):
     post = await _read_json_request(request)
-    o = parse_download_options(post)
+    url, options = parse_download_options(post)
     cic = post.get('check_interval_minutes')
     if cic is None:
         cic = config.SUBSCRIPTION_DEFAULT_CHECK_INTERVAL
@@ -1057,14 +1260,7 @@ async def subscribe(request):
         raise web.HTTPBadRequest(reason='check_interval_minutes must be an integer') from exc
     if cic < 1:
         raise web.HTTPBadRequest(reason='check_interval_minutes must be at least 1')
-    try:
-        skip_subscriber_only = coerce_optional_bool(
-            post.get('skip_subscriber_only'),
-            default=False,
-            field_name='skip_subscriber_only',
-        )
-    except ValueError as exc:
-        raise web.HTTPBadRequest(reason=str(exc)) from exc
+    skip_subscriber_only = _bool_field(post, 'skip_subscriber_only', False)
 
     # A t= timestamp in the URL means "start playing here" and parse_download_options
     # turns it into a clip start, which is right for a one-off download of that video.
@@ -1076,31 +1272,32 @@ async def subscribe(request):
         _clip_field_provided_in_post(post.get('clip_start'))
         or _clip_field_provided_in_post(post.get('clip_end'))
     )
-    sub_clip_start = o['clip_start'] if clip_given else None
-    sub_clip_end = o['clip_end'] if clip_given else None
+    if not clip_given:
+        options = options.replace(clip_start=None, clip_end=None)
 
     result = await submgr.add_subscription(
-        o['url'],
+        url,
         check_interval_minutes=cic,
-        download_type=o['download_type'],
-        codec=o['codec'],
-        format=o['format'],
-        quality=o['quality'],
-        folder=o['folder'] or '',
-        custom_name_prefix=o['custom_name_prefix'],
-        auto_start=o['auto_start'],
-        playlist_item_limit=o['playlist_item_limit'],
-        split_by_chapters=o['split_by_chapters'],
-        chapter_template=o['chapter_template'],
-        subtitle_language=o['subtitle_language'],
-        subtitle_mode=o['subtitle_mode'],
-        ytdl_options_presets=o['ytdl_options_presets'],
-        ytdl_options_overrides=o['ytdl_options_overrides'],
-        sponsorblock=o['sponsorblock'],
+        download_type=options.download_type,
+        codec=options.codec,
+        format=options.format,
+        quality=options.quality,
+        folder=options.folder or '',
+        custom_name_prefix=options.custom_name_prefix,
+        auto_start=options.auto_start,
+        playlist_item_limit=options.playlist_item_limit,
+        split_by_chapters=options.split_by_chapters,
+        chapter_template=options.chapter_template,
+        subtitle_language=options.subtitle_language,
+        subtitle_mode=options.subtitle_mode,
+        ytdl_options_presets=list(options.ytdl_options_presets),
+        ytdl_options_overrides=options.ytdl_options_overrides,
+        sponsorblock=options.sponsorblock,
+        audio_tags=options.audio_tags,
         title_regex=post.get('title_regex'),
         skip_subscriber_only=skip_subscriber_only,
-        clip_start=sub_clip_start,
-        clip_end=sub_clip_end,
+        clip_start=options.clip_start,
+        clip_end=options.clip_end,
     )
     return web.Response(text=serializer.encode(result))
 
@@ -1171,7 +1368,10 @@ async def delete(request):
     if where not in ['queue', 'done']:
         log.error("Bad request: incorrect 'where' value")
         raise web.HTTPBadRequest()
-    status = await (dqueue.cancel(ids) if where == 'queue' else dqueue.clear(ids))
+    delete_files = post.get('delete_files', False)
+    if not isinstance(delete_files, bool):
+        raise web.HTTPBadRequest(reason="'delete_files' must be a boolean")
+    status = await (dqueue.cancel(ids) if where == 'queue' else dqueue.clear(ids, delete_files=delete_files))
     log.info(f"Download delete request processed for ids: {ids}, where: {where}")
     return web.Response(text=serializer.encode(status))
 
@@ -1296,81 +1496,94 @@ async def history(request):
     log.info("Sending download history")
     return web.Response(text=serializer.encode(history))
 
+async def _emit_connect_finish(sid):
+    """Slow connect-finish events, dispatched off the connect-ACK path.
+
+    The socket.io connect ACK is sent only after the ``connect`` handler
+    returns, so any work awaited there delays the handshake. ``get_custom_dirs()``
+    runs ``path.glob('**/')`` over the whole download tree (over 100s on a
+    large library) and ``get_options_update_time()`` touches the filesystem;
+    emitting them inline kept the client stuck on "Connecting..." long past the
+    engine.io ping window. Both are therefore dispatched as a background task
+    after the handler has returned, so the ACK is immediate and the client
+    connects instantly, receiving the directory list a moment later.
+    """
+    loop = asyncio.get_running_loop()
+    if config.CUSTOM_DIRS:
+        dirs = await loop.run_in_executor(None, get_custom_dirs)
+        await sio.emit('custom_dirs', serializer.encode(dirs), to=sid)
+    if config.YTDL_OPTIONS_FILE:
+        options_update = await loop.run_in_executor(None, get_options_update_time)
+        await sio.emit('ytdl_options_changed', serializer.encode(options_update), to=sid)
+
 @sio.event
 async def connect(sid, environ):
     log.info(f"Client connected: {sid}")
+    # Gather + serialize on the event loop: ``dqueue.get()`` iterates the queue
+    # dicts and the encoder reads ``DownloadInfo`` objects the progress hooks
+    # are updating, so a worker thread risks ``RuntimeError: dictionary changed
+    # size during iteration`` (the client would get no ``all`` event). A ~53 KB
+    # payload serializes in milliseconds, so this costs nothing on the
+    # handshake -- ``_save_dict_async`` serializes on the loop for the same
+    # reason. 'all' goes out first: the UI populates its state from it before
+    # the finer-grained events that may follow.
     await sio.emit('all', serializer.encode(dqueue.get()), to=sid)
     await sio.emit('subscriptions_all', serializer.encode([s.to_public_dict() for s in submgr.list_all()]), to=sid)
+    await sio.emit('formats', serializer.encode(format_catalog.public_catalog()), to=sid)
     await sio.emit('configuration', serializer.encode(config.frontend_safe()), to=sid)
-    if config.CUSTOM_DIRS:
-        # get_custom_dirs() can walk the whole download tree on a cache miss;
-        # keep that off the event loop so a large library doesn't stall every
-        # client's connect handshake.
-        dirs = await asyncio.get_running_loop().run_in_executor(None, get_custom_dirs)
-        await sio.emit('custom_dirs', serializer.encode(dirs), to=sid)
-    if config.YTDL_OPTIONS_FILE:
-        await sio.emit('ytdl_options_changed', serializer.encode(get_options_update_time()), to=sid)
+    # The slow directory / ytdl-options emits must NOT be awaited here: the
+    # connect ACK is sent only when this handler returns, so awaiting them
+    # would delay the handshake past the engine.io ping window. Dispatch them
+    # as a background task (strong-referenced, failures logged) so the ACK
+    # goes out immediately.
+    bg_tasks.create_task(_emit_connect_finish(sid), name=f"connect_finish_{sid}")
+
+_CUSTOM_DIRS_CACHE_TTL_SECONDS = 5
+# (key, time, value) of the last listing; a connect storm reuses it.
+_custom_dirs_cache = None
+
+
+def _list_subdirs(base: str) -> list[str]:
+    """Every directory under *base*, relative to it, minus the excluded ones.
+
+    '' (the base itself) comes first, and is listed even when the directory
+    is empty or does not exist yet. Paths are made relative with
+    Path.relative_to rather than by stripping *base* as a string prefix,
+    which with the default DOWNLOAD_DIR '.' also stripped the dot off
+    '.hidden', listing it as 'hidden' where the exclude pattern missed it.
+    """
+    root = pathlib.Path(base)
+    exclude = config.CUSTOM_DIRS_EXCLUDE_RE
+    dirs = ['']
+    for path in root.glob('**/'):
+        rel = path.relative_to(root).as_posix()
+        if rel == '.' or (exclude is not None and exclude.search(rel)):
+            continue
+        dirs.append(rel)
+    return dirs
+
 
 def get_custom_dirs():
-    cache_ttl_seconds = 5
+    global _custom_dirs_cache
     now = time.monotonic()
-    cache_key = (
-        config.DOWNLOAD_DIR,
-        config.AUDIO_DOWNLOAD_DIR,
-        config.CUSTOM_DIRS_EXCLUDE_REGEX,
-    )
+    key = (config.DOWNLOAD_DIR, config.AUDIO_DOWNLOAD_DIR, config.CUSTOM_DIRS_EXCLUDE_REGEX)
     if (
-        hasattr(get_custom_dirs, "_cache_key")
-        and hasattr(get_custom_dirs, "_cache_value")
-        and hasattr(get_custom_dirs, "_cache_time")
-        and get_custom_dirs._cache_key == cache_key
-        and (now - get_custom_dirs._cache_time) < cache_ttl_seconds
+        _custom_dirs_cache is not None
+        and _custom_dirs_cache[0] == key
+        and now - _custom_dirs_cache[1] < _CUSTOM_DIRS_CACHE_TTL_SECONDS
     ):
-        return get_custom_dirs._cache_value
+        return _custom_dirs_cache[2]
 
-    def recursive_dirs(base):
-        path = pathlib.Path(base)
-
-        # Converts PosixPath object to string, and remove base/ prefix
-        def convert(p):
-            s = str(p)
-            if s.startswith(base):
-                s = s[len(base):]
-
-            if s.startswith('/'):
-                s = s[1:]
-
-            return s
-
-        # Include only directories which do not match the exclude filter
-        def include_dir(d):
-            if len(config.CUSTOM_DIRS_EXCLUDE_REGEX) == 0:
-                return True
-            else:
-                return re.search(config.CUSTOM_DIRS_EXCLUDE_REGEX, d) is None
-
-        # Recursively lists all subdirectories of DOWNLOAD_DIR.
-        # Always include '' (the base directory itself) even when the
-        # directory is empty or does not yet exist.
-        dirs = list(filter(include_dir, map(convert, path.glob('**/'))))
-        if '' not in dirs:
-            dirs.insert(0, '')
-
-        return dirs
-
-    download_dir = recursive_dirs(config.DOWNLOAD_DIR)
-
+    download_dir = _list_subdirs(config.DOWNLOAD_DIR)
     audio_download_dir = download_dir
     if config.DOWNLOAD_DIR != config.AUDIO_DOWNLOAD_DIR:
-        audio_download_dir = recursive_dirs(config.AUDIO_DOWNLOAD_DIR)
+        audio_download_dir = _list_subdirs(config.AUDIO_DOWNLOAD_DIR)
 
     result = {
         "download_dir": download_dir,
         "audio_download_dir": audio_download_dir
     }
-    get_custom_dirs._cache_key = cache_key
-    get_custom_dirs._cache_time = now
-    get_custom_dirs._cache_value = result
+    _custom_dirs_cache = (key, now, result)
     return result
 
 @routes.get(config.URL_PREFIX)
@@ -1587,6 +1800,7 @@ async def add_cors(request):
     return web.Response(text=serializer.encode({"status": "ok"}))
 
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'add', add_cors)
+app.router.add_route('OPTIONS', config.URL_PREFIX + 'browse', add_cors)
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'cancel-add', add_cors)
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'retry', add_cors)
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'subscribe', add_cors)
@@ -1640,15 +1854,6 @@ async def on_prepare(request, response):
 
 app.on_response_prepare.append(on_prepare)
 
-def supports_reuse_port():
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        sock.close()
-        return True
-    except (AttributeError, OSError):
-        return False
-
 def isAccessLogEnabled():
     if config.ENABLE_ACCESSLOG:
         return access_logger
@@ -1671,8 +1876,8 @@ if __name__ == '__main__':
     if config.HTTPS:
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.load_cert_chain(certfile=config.CERTFILE, keyfile=config.KEYFILE)
-        web.run_app(app, host=config.HOST, port=int(config.PORT), reuse_port=supports_reuse_port(), ssl_context=ssl_context, access_log=isAccessLogEnabled())
+        web.run_app(app, host=config.HOST, port=config.PORT, ssl_context=ssl_context, access_log=isAccessLogEnabled())
     else:
-        web.run_app(app, host=config.HOST, port=int(config.PORT), reuse_port=supports_reuse_port(), access_log=isAccessLogEnabled())
+        web.run_app(app, host=config.HOST, port=config.PORT, access_log=isAccessLogEnabled())
     if _RESTART_FOR_UPDATE:
         sys.exit(42)

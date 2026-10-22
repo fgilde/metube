@@ -19,8 +19,10 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
+      # Node 25+ no longer ships corepack, and lts/* moves to Node 26 in
+      # October 2026, so install it rather than rely on the bundled copy.
       - name: Enable pnpm
-        run: corepack enable
+        run: npm install -g corepack && corepack enable
       - name: Install frontend dependencies
         working-directory: ui
         run: pnpm install --frozen-lockfile
@@ -40,7 +42,7 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --frozen --group dev
       - name: Run backend smoke checks
-        run: python -m compileall app
+        run: uv run python -m compileall -q app
       - name: Run backend tests
         run: uv run pytest app/tests/
       - name: Run Trivy filesystem scan
@@ -123,17 +125,15 @@ jobs:
     if: needs.dockerhub-build-push.outputs.dockerhub == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Sync README
-        uses: docker://lsiodev/readme-sync:latest
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
-          GIT_REPOSITORY: ${{ github.repository }}
-          DOCKER_REPOSITORY: ${{ secrets.DOCKERHUB_REPOSITORY }}
-          GIT_BRANCH: master
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Sync README and short description
+        uses: peter-evans/dockerhub-description@v5
         with:
-          entrypoint: node
-          args: /opt/docker-readme-sync/sync
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          repository: ${{ secrets.DOCKERHUB_REPOSITORY }}
+          short-description: ${{ github.event.repository.description }}
 
   create-release:
     needs: dockerhub-build-push

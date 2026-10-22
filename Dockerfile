@@ -14,7 +14,7 @@ RUN corepack enable && corepack prepare pnpm --activate
 RUN CI=true pnpm install && pnpm run build
 
 
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 WORKDIR /app
 
@@ -27,7 +27,7 @@ RUN sed -i 's/\r$//g' docker-entrypoint.sh && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
-      ffmpeg \
+      xz-utils \
       unzip \
       aria2 \
       coreutils \
@@ -39,15 +39,27 @@ RUN sed -i 's/\r$//g' docker-entrypoint.sh && \
     UV_PROJECT_ENVIRONMENT=/usr/local uv sync --frozen --no-dev --compile-bytecode && \
     uv cache clean && \
     rm -f /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/uvw && \
-    # No "-y": that makes the installer run the freshly downloaded deno for its
-    # shell-profile setup, which crashes under QEMU for the arm64 build. The
-    # binary lands in /usr/local/bin either way, which is all yt-dlp needs.
-    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
     apt-get purge -y --auto-remove build-essential && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir /.cache && chmod 777 /.cache
 
 ARG TARGETARCH
+
+# ffmpeg is a static build of upstream's 8.1 release branch rather than
+# Debian's package: Debian stable stays a major version behind, and its 7.1
+# cannot seek into YouTube's HLS formats, so clip downloads came out with no
+# video (#1092). BtbN's builds are the ones yt-dlp's own FFmpeg-Builds fork;
+# the release-branch build takes 8.1 point releases only. Bump FFMPEG_BRANCH
+# deliberately, after testing clips and audio extraction on the new version.
+ARG FFMPEG_BRANCH=8.1
+RUN case "$TARGETARCH" in \
+      amd64) FFMPEG_ARCH="linux64" ;; \
+      arm64) FFMPEG_ARCH="linuxarm64" ;; \
+      *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n${FFMPEG_BRANCH}-latest-${FFMPEG_ARCH}-gpl-${FFMPEG_BRANCH}.tar.xz" \
+      | tar -xJ -C /usr/local/bin --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe' && \
+    ffmpeg -version | head -n 1
 
 RUN BGUTIL_TAG="$(curl -Ls -o /dev/null -w '%{url_effective}' https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest | sed 's#.*/tag/##')" && \
     case "$TARGETARCH" in \

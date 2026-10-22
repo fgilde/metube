@@ -2,7 +2,7 @@ import { TestBed } from '@angular/core/testing';
 import { provideHttpClient, HttpErrorResponse } from '@angular/common/http';
 import { provideHttpClientTesting, HttpTestingController } from '@angular/common/http/testing';
 import { Subject } from 'rxjs';
-import { DownloadsService, AddDownloadPayload } from './downloads.service';
+import { DownloadsService, AddDownloadPayload, BrowsePayload } from './downloads.service';
 import { MeTubeSocket } from './metube-socket.service';
 import { Download } from '../interfaces';
 
@@ -37,6 +37,7 @@ function basePayload(): AddDownloadPayload {
     autoStart: true,
     splitByChapters: false,
     sponsorblock: false,
+    audioTags: 'with_cover',
     chapterTemplate: '',
     subtitleLanguage: 'en',
     subtitleMode: 'prefer_manual',
@@ -44,6 +45,7 @@ function basePayload(): AddDownloadPayload {
     ytdlOptionsOverrides: '',
     clipStart: '',
     clipEnd: '',
+    videoPassword: '',
   };
 }
 
@@ -81,6 +83,7 @@ describe('DownloadsService', () => {
         playlist_item_limit: 0,
         auto_start: true,
         split_by_chapters: false,
+        audio_tags: 'with_cover',
         chapter_template: '',
         subtitle_language: 'en',
         subtitle_mode: 'prefer_manual',
@@ -109,6 +112,46 @@ describe('DownloadsService', () => {
     req.flush({ status: 'ok' });
   });
 
+  it('add() sends video_password unchanged (not trimmed) when set', () => {
+    service
+      .add({
+        ...basePayload(),
+        videoPassword: ' s3cret',
+      })
+      .subscribe();
+    const req = httpMock.expectOne('add');
+    expect(req.request.body).toEqual(
+      expect.objectContaining({
+        video_password: ' s3cret',
+      }),
+    );
+    req.flush({ status: 'ok' });
+  });
+
+  it('add() omits video_password when empty or unset', () => {
+    service.add(basePayload()).subscribe();
+    let req = httpMock.expectOne('add');
+    expect(req.request.body).not.toHaveProperty('video_password');
+    req.flush({ status: 'ok' });
+
+    service.add({ ...basePayload(), videoPassword: undefined }).subscribe();
+    req = httpMock.expectOne('add');
+    expect(req.request.body).not.toHaveProperty('video_password');
+    req.flush({ status: 'ok' });
+  });
+
+  it('keeps the format catalog the server sends on connect', () => {
+    const seen: unknown[] = [];
+    service.formatsChanged.subscribe(c => seen.push(c));
+    expect(service.formats).toBeNull();
+
+    const catalog = { download_type: { default: 'video', options: [] } };
+    socket.emit('formats', JSON.stringify(catalog));
+
+    expect(service.formats).toEqual(catalog);
+    expect(seen).toEqual([catalog]);
+  });
+
   it('getPresets() fetches configured preset names', () => {
     service.getPresets().subscribe((result) => {
       expect(result).toEqual({ presets: ['Preset A'] });
@@ -124,6 +167,39 @@ describe('DownloadsService', () => {
     expect(req.request.method).toBe('POST');
     expect(req.request.body).toEqual({ id: 'https://example.com/v' });
     req.flush({ status: 'ok' });
+  });
+
+  it('browse() posts snake_case fields matching backend', () => {
+    const payload: BrowsePayload = {
+      url: 'https://example.com/playlist',
+      playlistItemLimit: 25,
+      ytdlOptionsPresets: ['Preset A'],
+      ytdlOptionsOverrides: '{"a":1}',
+    };
+    const entries = [{ url: 'https://example.com/v1', title: 'One', duration: 61 }];
+    let result: unknown;
+    service.browse(payload).subscribe((r) => (result = r));
+    const req = httpMock.expectOne('browse');
+    expect(req.request.method).toBe('POST');
+    expect(req.request.body).toEqual({
+      url: 'https://example.com/playlist',
+      playlist_item_limit: 25,
+      ytdl_options_presets: ['Preset A'],
+      ytdl_options_overrides: '{"a":1}',
+    });
+    req.flush({ status: 'ok', title: 'List', entries });
+    expect(result).toEqual({ status: 'ok', title: 'List', entries });
+  });
+
+  it('browse() surfaces HTTP errors as a status object', () => {
+    let result: unknown;
+    service
+      .browse({ url: 'u', playlistItemLimit: 0, ytdlOptionsPresets: [], ytdlOptionsOverrides: '' })
+      .subscribe((r) => (result = r));
+    httpMock
+      .expectOne('browse')
+      .flush({ status: 'error', msg: 'nope' }, { status: 400, statusText: 'Bad Request' });
+    expect(result).toEqual({ status: 'error', msg: 'nope' });
   });
 
   it('cancelAdd posts to cancel-add', () => {
@@ -165,6 +241,28 @@ describe('DownloadsService', () => {
     expect(dl.deleting).toBe(true);
     const req = httpMock.expectOne('delete');
     expect(req.request.body).toEqual({ where: 'queue', ids: ['u1'] });
+    req.flush({});
+  });
+
+  it('delById posts delete_files: true when requested', () => {
+    service.delById('done', ['u1'], true).subscribe();
+    const req = httpMock.expectOne('delete');
+    expect(req.request.body).toEqual({ where: 'done', ids: ['u1'], delete_files: true });
+    req.flush({});
+  });
+
+  it('delById posts delete_files: false when requested', () => {
+    service.delById('done', ['u1'], false).subscribe();
+    const req = httpMock.expectOne('delete');
+    expect(req.request.body).toEqual({ where: 'done', ids: ['u1'], delete_files: false });
+    req.flush({});
+  });
+
+  it('delById omits delete_files when not specified', () => {
+    service.delById('done', ['u1']).subscribe();
+    const req = httpMock.expectOne('delete');
+    expect(req.request.body).toEqual({ where: 'done', ids: ['u1'] });
+    expect(req.request.body).not.toHaveProperty('delete_files');
     req.flush({});
   });
 

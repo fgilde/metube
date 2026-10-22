@@ -1,10 +1,16 @@
 import { inject, Injectable } from '@angular/core';
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
-import { of, Subject } from 'rxjs';
+import { Observable, of, Subject } from 'rxjs';
 import { catchError } from 'rxjs/operators';
 import { MeTubeSocket } from './metube-socket.service';
-import { Download, Status, State } from '../interfaces';
+import { Download, FormatCatalog, Status, State } from '../interfaces';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+
+// Maximum number of /add or /retry requests to have in flight at once when
+// queuing many items (batch import, picked playlist entries, Retry failed).
+// Each one is a yt-dlp metadata extraction on the server, which must not be
+// hit with hundreds at a time when a list is long.
+export const ADD_REQUEST_CONCURRENCY = 4;
 
 export interface AddDownloadPayload {
   url: string;
@@ -18,6 +24,7 @@ export interface AddDownloadPayload {
   autoStart: boolean;
   splitByChapters: boolean;
   sponsorblock: boolean;
+  audioTags: string;
   chapterTemplate: string;
   subtitleLanguage: string;
   subtitleMode: string;
@@ -25,6 +32,14 @@ export interface AddDownloadPayload {
   ytdlOptionsOverrides: string;
   clipStart?: string;
   clipEnd?: string;
+  videoPassword?: string;
+}
+
+export interface BrowsePayload {
+  url: string;
+  playlistItemLimit: number;
+  ytdlOptionsPresets: string[];
+  ytdlOptionsOverrides: string;
 }
 
 export interface ServerSettings {
@@ -34,6 +49,16 @@ export interface ServerSettings {
 }
 
 export type ServerSettingsChanges = Partial<Pick<ServerSettings, 'direct_routes' | 'direct_routes_key'>>;
+export interface BrowseEntry {
+  url: string;
+  title: string;
+  duration: number | null;
+}
+
+export interface BrowseResult extends Status {
+  title?: string;
+  entries?: BrowseEntry[];
+}
 
 @Injectable({
   providedIn: 'root'
@@ -46,12 +71,14 @@ export class DownloadsService {
   done = new Map<string, Download>();
   queueChanged = new Subject<void>();
   doneChanged = new Subject<void>();
-  customDirsChanged = new Subject<Record<string, string[]>>();
   ytdlOptionsChanged = new Subject<Record<string, unknown>>();
   configurationChanged = new Subject<Record<string, unknown>>();
+  formatsChanged = new Subject<FormatCatalog>();
   updated = new Subject<void>();
 
   configuration: Record<string, unknown> = {};
+  // The download options the server offers; null until it sends them.
+  formats: FormatCatalog | null = null;
   customDirs: Record<string, string[]> = {};
 
   constructor() {
@@ -113,6 +140,13 @@ export class DownloadsService {
       this.done.delete(data);
       this.doneChanged.next();
     });
+    this.socket.fromEvent('formats')
+    .pipe(takeUntilDestroyed())
+    .subscribe((strdata: string) => {
+      const data: FormatCatalog = JSON.parse(strdata);
+      this.formats = data;
+      this.formatsChanged.next(data);
+    });
     this.socket.fromEvent('configuration')
     .pipe(takeUntilDestroyed())
     .subscribe((strdata: string) => {
@@ -127,7 +161,6 @@ export class DownloadsService {
       const data = JSON.parse(strdata);
       console.debug("got custom_dirs:", data);
       this.customDirs = data;
-      this.customDirsChanged.next(data);
     });
     this.socket.fromEvent('ytdl_options_changed')
     .pipe(takeUntilDestroyed())
@@ -159,6 +192,7 @@ export class DownloadsService {
       auto_start: payload.autoStart,
       split_by_chapters: payload.splitByChapters,
       sponsorblock: payload.sponsorblock,
+      audio_tags: payload.audioTags,
       chapter_template: payload.chapterTemplate,
       subtitle_language: payload.subtitleLanguage,
       subtitle_mode: payload.subtitleMode,
@@ -169,7 +203,19 @@ export class DownloadsService {
     const ce = payload.clipEnd?.trim();
     if (cs) body['clip_start'] = cs;
     if (ce) body['clip_end'] = ce;
+    if (payload.videoPassword) body['video_password'] = payload.videoPassword;
     return this.http.post<Status>('add', body).pipe(
+      catchError(this.handleHTTPError)
+    );
+  }
+
+  public browse(payload: BrowsePayload): Observable<BrowseResult> {
+    return this.http.post<BrowseResult>('browse', {
+      url: payload.url,
+      playlist_item_limit: payload.playlistItemLimit,
+      ytdl_options_presets: payload.ytdlOptionsPresets,
+      ytdl_options_overrides: payload.ytdlOptionsOverrides,
+    }).pipe(
       catchError(this.handleHTTPError)
     );
   }
@@ -192,7 +238,7 @@ export class DownloadsService {
     );
   }
 
-  public delById(where: State, ids: string[]) {
+  public delById(where: State, ids: string[], deleteFiles?: boolean) {
     const map = this[where];
     if (map) {
       for (const id of ids) {
@@ -202,7 +248,11 @@ export class DownloadsService {
         }
       }
     }
-    return this.http.post<Status>('delete', {where: where, ids: ids}).pipe(
+    const body: Record<string, unknown> = {where: where, ids: ids};
+    if (deleteFiles !== undefined) {
+      body['delete_files'] = deleteFiles;
+    }
+    return this.http.post<Status>('delete', body).pipe(
       catchError((err: HttpErrorResponse) => {
         // Request failed — the rows would otherwise stay disabled forever
         // with no way to retry, since nothing ever clears `deleting`.
@@ -226,11 +276,6 @@ export class DownloadsService {
     return this.startById(ids);
   }
 
-  public delByFilter(where: State, filter: (dl: Download) => boolean) {
-    const ids: string[] = [];
-    this[where].forEach((dl: Download) => { if (filter(dl)) ids.push(dl.url) });
-    return this.delById(where, ids);
-  }
   public cancelAdd() {
     return this.http.post<Status>('cancel-add', {}).pipe(
       catchError(this.handleHTTPError)

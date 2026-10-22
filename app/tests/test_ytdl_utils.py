@@ -1,78 +1,29 @@
-"""Tests for pure helpers and migration logic in ``ytdl``."""
+"""Tests for pure helpers and migration logic in ``ytdl``.
+
+These run against the real yt-dlp, as every other test module does.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
+import json
 import os
-import pickle
 import signal
-import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
+import warnings
+from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock, patch
 
-fake_yt_dlp = types.ModuleType("yt_dlp")
-fake_networking = types.ModuleType("yt_dlp.networking")
-fake_impersonate = types.ModuleType("yt_dlp.networking.impersonate")
-fake_postprocessor = types.ModuleType("yt_dlp.postprocessor")
-fake_postprocessor_common = types.ModuleType("yt_dlp.postprocessor.common")
-fake_utils = types.ModuleType("yt_dlp.utils")
-
-
-class _ImpersonateTarget:
-    @staticmethod
-    def from_str(value):
-        return value
-
-
-class _PostProcessor:
-    def __init__(self, downloader=None):
-        self._downloader = downloader
-
-
-class _YoutubeDL:
-    """Minimal stand-in so ``_ConfinedYoutubeDL`` can subclass it under the shim.
-
-    ``prepare_filename`` is patched per-test; the real containment logic lives in
-    the ``_ConfinedYoutubeDL`` override, which is what the tests exercise.
-    """
-
-    def __init__(self, params=None, **kwargs):
-        self.params = params or {}
-
-    def prepare_filename(self, *args, **kwargs):
-        return ""
-
-    def add_post_processor(self, *args, **kwargs):
-        pass
-
-
-fake_utils.DownloadError = type("DownloadError", (Exception,), {})
-fake_utils.YoutubeDLError = fake_utils.DownloadError
-fake_yt_dlp.YoutubeDL = _YoutubeDL
-fake_impersonate.ImpersonateTarget = _ImpersonateTarget
-fake_networking.impersonate = fake_impersonate
-fake_postprocessor_common.PostProcessor = _PostProcessor
-# The inner ``key`` group mirrors the real ``STR_FORMAT_RE_TMPL`` so that
-# ``_OUTTMPL_FIELD_RE`` (compiled at import time) has the named group that
-# ``_resolve_outtmpl_fields`` reads via ``match.group('key')``.
-fake_utils.STR_FORMAT_RE_TMPL = r"(?P<prefix>)%\((?P<has_key>(?P<key>{}))\)(?P<format>[-0-9.]*{})"
-fake_utils.STR_FORMAT_TYPES = "diouxXeEfFgGcrsa"
-fake_yt_dlp.networking = fake_networking
-fake_yt_dlp.postprocessor = fake_postprocessor
-fake_yt_dlp.utils = fake_utils
-sys.modules.setdefault("yt_dlp", fake_yt_dlp)
-sys.modules.setdefault("yt_dlp.networking", fake_networking)
-sys.modules.setdefault("yt_dlp.networking.impersonate", fake_impersonate)
-sys.modules.setdefault("yt_dlp.postprocessor", fake_postprocessor)
-sys.modules.setdefault("yt_dlp.postprocessor.common", fake_postprocessor_common)
-sys.modules.setdefault("yt_dlp.utils", fake_utils)
-
 import ytdl
+from state_store import to_json_compatible
 from ytdl import (
     Download,
     DownloadInfo,
@@ -82,18 +33,10 @@ from ytdl import (
     _pot_provider_urls,
     _AlbumArtistPostProcessor,
     _resolve_outtmpl_fields,
-    _sanitize_entry_for_pickle,
+    _sanitize_entry,
     _sanitize_path_component,
     _short_title_for_failed_url,
 )
-
-# Detect whether the real yt-dlp is loaded (as opposed to the minimal fake
-# shim above).  _resolve_outtmpl_fields needs YoutubeDL.evaluate_outtmpl at
-# runtime, which the shim's YoutubeDL stand-in deliberately does not provide.
-_has_real_ytdlp = hasattr(
-    getattr(sys.modules.get("yt_dlp"), "YoutubeDL", None), "evaluate_outtmpl"
-)
-
 
 class AlbumArtistPostProcessorTests(unittest.TestCase):
     def setUp(self):
@@ -254,7 +197,6 @@ class SanitizePathComponentTests(unittest.TestCase):
         self.assertEqual(_sanitize_path_component('   '), '_')
 
 
-@unittest.skipUnless(_has_real_ytdlp, "requires real yt-dlp")
 class ResolveOuttmplFieldsTests(unittest.TestCase):
     """Tests for _resolve_outtmpl_fields (delegates to yt-dlp's template engine)."""
 
@@ -424,40 +366,47 @@ class ConfinedYoutubeDLTests(unittest.TestCase):
             self._prepared_path(escaping)
 
 
-class SanitizeEntryForPickleTests(unittest.TestCase):
+class SanitizeEntryTests(unittest.TestCase):
     def test_nested(self):
         def g():
             yield 1
 
         obj = {"a": g(), "b": [g()]}
-        out = _sanitize_entry_for_pickle(obj)
+        out = _sanitize_entry(obj)
         self.assertEqual(out, {"a": [1], "b": [[1]]})
-        pickle.dumps(out)
+        json.dumps(to_json_compatible(out))
 
     def test_plain(self):
-        self.assertEqual(_sanitize_entry_for_pickle(5), 5)
+        self.assertEqual(_sanitize_entry(5), 5)
 
     def test_set_converted_to_list(self):
         obj = {"s": {1, 2}}
-        out = _sanitize_entry_for_pickle(obj)
+        out = _sanitize_entry(obj)
         self.assertEqual(sorted(out["s"]), [1, 2])
-        pickle.dumps(out)
+        json.dumps(to_json_compatible(out))
 
     def test_map_iterator(self):
-        out = _sanitize_entry_for_pickle({"m": map(int, ["1", "2"])})
+        out = _sanitize_entry({"m": map(int, ["1", "2"])})
         self.assertEqual(out, {"m": [1, 2]})
 
     def test_lock_replaced_with_none(self):
         lock = threading.Lock()
-        out = _sanitize_entry_for_pickle({"k": lock})
+        out = _sanitize_entry({"k": lock})
         self.assertIsNone(out["k"])
-        pickle.dumps(out)
+        json.dumps(to_json_compatible(out))
+
+    def test_value_the_json_store_cannot_hold_becomes_none(self):
+        # Picklable, but not something the JSON state store can encode: it
+        # used to be kept, and then failed the state write -- and the add.
+        out = _sanitize_entry({"price": Decimal("1.5"), "ok": "yes", "when": datetime(2026, 1, 1)})
+        self.assertEqual(out, {"price": None, "ok": "yes", "when": datetime(2026, 1, 1)})
+        json.dumps(to_json_compatible(out))
 
     def test_ordered_dict(self):
         from collections import OrderedDict
 
         od = OrderedDict([("z", 1), ("a", 2)])
-        out = _sanitize_entry_for_pickle(od)
+        out = _sanitize_entry(od)
         self.assertEqual(out, {"z": 1, "a": 2})
 
 
@@ -742,6 +691,76 @@ class SponsorBlockPostprocessorTests(unittest.TestCase):
         keys = [pp['key'] for pp in params['postprocessors']]
         self.assertEqual(keys, ['SponsorBlock', 'ModifyChapters', 'FFmpegSplitChapters'])
         self.assertEqual(params['outtmpl']['chapter'], '%(section_number)s.%(ext)s')
+
+
+class AudioTagsParamsTests(unittest.TestCase):
+    """The per-download Tags choice reaches the yt-dlp params the subprocess builds."""
+
+    @staticmethod
+    def _audio_download(fmt, audio_tags):
+        download = _make_test_download()
+        download.info.download_type = "audio"
+        download.info.audio_tags = audio_tags
+        return Download(
+            "/tmp", "/tmp", "%(title)s.%(ext)s", "%(title)s.%(ext)s", "best", fmt, {}, download.info
+        )
+
+    def test_auto_without_tags_adds_no_tagging(self):
+        params = _capture_ytdl_params(self._audio_download("auto", "none"))
+        self.assertEqual(params["format"], "bestaudio/best")
+        self.assertEqual([pp["key"] for pp in params["postprocessors"]], ["FFmpegExtractAudio"])
+        self.assertNotIn("writethumbnail", params)
+
+    def test_no_cover_writes_tags_only(self):
+        params = _capture_ytdl_params(self._audio_download("mp3", "no_cover"))
+        self.assertEqual(
+            [pp["key"] for pp in params["postprocessors"]], ["FFmpegExtractAudio", "FFmpegMetadata"]
+        )
+
+
+@unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "needs the fork start method")
+class CancelSignalTests(unittest.TestCase):
+    def test_sigint_stops_a_download_forked_from_an_asyncio_app(self):
+        """cancel() sends SIGINT so yt-dlp can wind down, escalating to SIGKILL
+        after a grace period. On Linux the download process is forked from the
+        aiohttp app, whose event loop replaces the SIGINT handler with asyncio's
+        no-op; a forked child inherited it, so SIGINT was always swallowed and
+        every cancel ended in SIGKILL."""
+        download = _make_test_download()
+        download.status_queue = types.SimpleNamespace(put=lambda _: None)
+
+        class SlowYdl:
+            def download(self, urls):
+                time.sleep(20)
+                return 0
+
+        # What loop.add_signal_handler(SIGINT, ...) leaves in the parent.
+        previous = signal.signal(signal.SIGINT, lambda *_: None)
+        try:
+            with patch('ytdl.install_socket_guard'), \
+                    patch.object(Download, '_make_youtube_dl', return_value=SlowYdl()):
+                proc = multiprocessing.get_context('fork').Process(target=download._download)
+                # Earlier tests leave executor threads behind; MeTube also forks
+                # from a threaded process, so the warning is expected here.
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', DeprecationWarning)
+                    proc.start()
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+        try:
+            deadline = time.monotonic() + 5
+            while os.getpgid(proc.pid) != proc.pid and time.monotonic() < deadline:
+                time.sleep(0.05)
+            time.sleep(0.5)  # let it get past setup and into download()
+            os.killpg(proc.pid, signal.SIGINT)
+            proc.join(5)
+            self.assertFalse(proc.is_alive(), 'SIGINT did not stop the download process')
+            self.assertEqual(proc.exitcode, 0)
+        finally:
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
 
 
 class ProgressThrottleTests(unittest.TestCase):
@@ -1157,6 +1176,13 @@ class DownloadInfoSetstateTests(unittest.TestCase):
         self.assertFalse(di.split_by_chapters)
         self.assertEqual(di.chapter_template, "")
 
+    def test_records_from_before_audio_tags_keep_the_cover_and_tags(self):
+        state = self._base_state(download_type="audio", codec="auto", format="mp3", quality="best")
+        state.pop("audio_tags", None)
+        di = DownloadInfo.__new__(DownloadInfo)
+        di.__setstate__(state)
+        self.assertEqual(di.audio_tags, "with_cover")
+
 
 class CompactPersistedEntryTests(unittest.TestCase):
     def test_keeps_only_playlist_and_channel_keys(self):
@@ -1350,3 +1376,55 @@ class UpdateStatusFileStatTests(unittest.IsolatedAsyncioTestCase):
             download.notifier.broadcast_statuses,
             ["postprocessing", "downloading", "postprocessing", "finished"],
         )
+
+
+class UserDictOptionMergeTests(unittest.TestCase):
+    """User outtmpl/paths used to replace MeTube's dicts wholesale."""
+
+    def test_outtmpl_keys_merge_into_metube_templates(self):
+        download = _make_test_download()
+        download.ytdl_opts['outtmpl'] = {'thumbnail': 'thumbs/%(title)s.%(ext)s'}
+
+        params = _capture_ytdl_params(download)
+
+        self.assertEqual(params['outtmpl'], {
+            'default': '%(title)s.%(ext)s',
+            'chapter': '%(title)s.%(ext)s',
+            'thumbnail': 'thumbs/%(title)s.%(ext)s',
+        })
+
+    def test_user_default_template_still_wins(self):
+        download = _make_test_download()
+        download.ytdl_opts['outtmpl'] = {'default': '%(id)s.%(ext)s'}
+        self.assertEqual(_capture_ytdl_params(download)['outtmpl']['default'], '%(id)s.%(ext)s')
+
+    def test_string_outtmpl_means_default(self):
+        download = _make_test_download()
+        download.ytdl_opts['outtmpl'] = '%(id)s.%(ext)s'
+        params = _capture_ytdl_params(download)
+        self.assertEqual(params['outtmpl']['default'], '%(id)s.%(ext)s')
+        self.assertIn('chapter', params['outtmpl'])
+
+    def test_paths_merge(self):
+        download = _make_test_download()
+        download.ytdl_opts['paths'] = {'thumbnail': 'thumbs'}
+        params = _capture_ytdl_params(download)
+        self.assertEqual(params['paths'], {'home': '/tmp', 'temp': '/tmp', 'thumbnail': 'thumbs'})
+
+    def test_chapter_split_does_not_mutate_the_user_dict(self):
+        download = _make_test_download()
+        user_outtmpl = {'thumbnail': 't'}
+        download.ytdl_opts['outtmpl'] = user_outtmpl
+        download.info.split_by_chapters = True
+        download.info.chapter_template = '%(section_number)s.%(ext)s'
+        params = _capture_ytdl_params(download)
+        self.assertEqual(params['outtmpl']['chapter'], '%(section_number)s.%(ext)s')
+        self.assertEqual(user_outtmpl, {'thumbnail': 't'})
+
+    def test_status_hooks_cannot_be_replaced(self):
+        download = _make_test_download()
+        download.ytdl_opts['progress_hooks'] = []
+        download.ytdl_opts['postprocessor_hooks'] = []
+        params = _capture_ytdl_params(download)
+        self.assertEqual(len(params['progress_hooks']), 1)
+        self.assertEqual(len(params['postprocessor_hooks']), 1)

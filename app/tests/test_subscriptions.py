@@ -9,7 +9,7 @@ import tempfile
 import time
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 fake_yt_dlp = types.ModuleType("yt_dlp")
 fake_networking = types.ModuleType("yt_dlp.networking")
@@ -30,10 +30,14 @@ sys.modules.setdefault("yt_dlp", fake_yt_dlp)
 sys.modules.setdefault("yt_dlp.networking", fake_networking)
 sys.modules.setdefault("yt_dlp.networking.impersonate", fake_impersonate)
 
+import subscriptions
 from subscriptions import (
+    NO_ENTRIES_MSG,
+    VIDEO_ONLY_MSG,
     SubscriptionInfo,
     SubscriptionManager,
     _is_subscriber_only_entry,
+    browse_playlist,
     coerce_optional_bool,
     extract_flat_playlist,
 )
@@ -364,6 +368,51 @@ class SubscriptionPersistenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sub.error, "queue failed")
             self.assertEqual(sub.seen_ids, ["v1"])
 
+    async def test_repeated_queue_errors_are_reported_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = _Queue()
+            mgr = SubscriptionManager(_Config(tmp), queue, _Notifier())
+
+            with patch(
+                "subscriptions.extract_flat_playlist",
+                side_effect=[
+                    (
+                        {"_type": "channel", "title": "Channel"},
+                        [{"id": "v1", "title": "One", "webpage_url": "https://example.com/v1"}],
+                    ),
+                    (
+                        {"_type": "channel", "title": "Channel"},
+                        [
+                            {"id": "v3", "title": "Three", "webpage_url": "https://example.com/v3"},
+                            {"id": "v2", "title": "Two", "webpage_url": "https://example.com/v2"},
+                            {"id": "v1", "title": "One", "webpage_url": "https://example.com/v1"},
+                        ],
+                    ),
+                ],
+            ):
+                result = await mgr.add_subscription(
+                    "https://example.com/channel",
+                    check_interval_minutes=60,
+                    download_type="video",
+                    codec="auto",
+                    format="any",
+                    quality="best",
+                    folder="",
+                    custom_name_prefix="",
+                    auto_start=True,
+                    playlist_item_limit=0,
+                    split_by_chapters=False,
+                    chapter_template="",
+                    subtitle_language="en",
+                    subtitle_mode="prefer_manual",
+                )
+                queue.fail = True
+                await mgr.check_now([result["subscription"]["id"]])
+
+            sub = mgr.list_all()[0]
+            self.assertEqual(sub.error, "queue failed")
+            self.assertEqual(sub.seen_ids, ["v1"])
+
     async def test_check_now_queues_new_video_and_updates_seen_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             queue = _Queue()
@@ -457,9 +506,9 @@ class SubscriptionPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(queue.entries), 1)
             _entry, args, _kwargs = queue.entries[0]
-            # add_entry(entry, download_type, ..., ytdl_options_overrides, clip_start, clip_end)
-            self.assertEqual(args[-2], 30.0)
-            self.assertEqual(args[-1], 90.0)
+            options, = args
+            self.assertEqual(options.clip_start, 30.0)
+            self.assertEqual(options.clip_end, 90.0)
 
     async def test_clip_bounds_survive_reload_and_default_to_none(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -524,8 +573,8 @@ class SubscriptionPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 await mgr.check_now([sub_id])
 
             self.assertEqual(len(queue.entries), 1)
-            _entry, _args, kwargs = queue.entries[0]
-            self.assertIs(kwargs["sponsorblock"], True)
+            _entry, (options,), _kwargs = queue.entries[0]
+            self.assertIs(options.sponsorblock, True)
 
     async def test_sponsorblock_survives_reload_and_defaults_to_false(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -541,6 +590,66 @@ class SubscriptionPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
             reloaded = SubscriptionManager(cfg, _Queue(), _Notifier())
             self.assertTrue(reloaded.get(sub_id).sponsorblock)
+
+    async def test_check_now_applies_subscription_audio_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = _Queue()
+            mgr = SubscriptionManager(_Config(tmp), queue, _Notifier())
+
+            with patch(
+                "subscriptions.extract_flat_playlist",
+                side_effect=[
+                    (
+                        {"_type": "channel", "title": "Channel"},
+                        [{"id": "v1", "title": "One", "webpage_url": "https://example.com/v1"}],
+                    ),
+                    (
+                        {"_type": "channel", "title": "Channel"},
+                        [
+                            {"id": "v2", "title": "Two", "webpage_url": "https://example.com/v2"},
+                            {"id": "v1", "title": "One", "webpage_url": "https://example.com/v1"},
+                        ],
+                    ),
+                ],
+            ):
+                result = await mgr.add_subscription(
+                    "https://example.com/channel",
+                    check_interval_minutes=60,
+                    download_type="audio",
+                    codec="auto",
+                    format="auto",
+                    quality="best",
+                    folder="",
+                    custom_name_prefix="",
+                    auto_start=True,
+                    playlist_item_limit=0,
+                    split_by_chapters=False,
+                    chapter_template="",
+                    subtitle_language="en",
+                    subtitle_mode="prefer_manual",
+                    audio_tags="none",
+                )
+                sub_id = result["subscription"]["id"]
+                await mgr.check_now([sub_id])
+
+            self.assertEqual(len(queue.entries), 1)
+            _entry, (options,), _kwargs = queue.entries[0]
+            self.assertEqual(options.audio_tags, "none")
+
+    async def test_audio_tags_survive_reload_and_default_to_with_cover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _Config(tmp)
+            mgr = SubscriptionManager(cfg, _Queue(), _Notifier())
+            sub_id = await self._add_one_subscription(mgr)
+            # Records written before the field existed simply take the default.
+            self.assertEqual(mgr.get(sub_id).audio_tags, "with_cover")
+
+            mgr.get(sub_id).audio_tags = "no_cover"
+            async with mgr._lock:
+                mgr._save_locked()
+
+            reloaded = SubscriptionManager(cfg, _Queue(), _Notifier())
+            self.assertEqual(reloaded.get(sub_id).audio_tags, "no_cover")
 
     async def test_check_now_queues_subscriber_only_when_skip_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1456,6 +1565,164 @@ class SubscriptionScanExtraOptsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(check_captured[0].get("cookiefile"), "preset.txt")
 
 
+class BrowsePlaylistTests(unittest.IsolatedAsyncioTestCase):
+    """browse_playlist is a read-only flat probe backing the Browse dialog."""
+
+    URL = "https://example.com/playlist"
+
+    def _config(self):
+        cfg = _Config("unused")
+        cfg.ALLOW_PRIVATE_ADDRESSES = False
+        return cfg
+
+    async def _browse(self, extract, *, cfg=None, limit=0, presets=None, overrides=None, url_error=None):
+        validate = MagicMock(return_value=url_error)
+        with patch("subscriptions.validate_url", validate), patch(
+            "subscriptions.extract_flat_playlist", extract
+        ):
+            result = await browse_playlist(
+                cfg or self._config(), self.URL, limit, presets, overrides
+            )
+        return result, validate
+
+    async def test_maps_entries_to_minimal_shape(self):
+        info = {"_type": "playlist", "title": "My List", "id": "PL1"}
+        entries = [
+            {"id": "a", "webpage_url": "https://example.com/a", "url": "https://x/ignored",
+             "title": "A", "duration": 61, "thumbnail": "https://example.com/a.jpg"},
+            {"id": "b", "url": "https://example.com/b", "duration": 12.5},
+            {"id": "c", "url": "https://example.com/c", "title": "C", "duration": "1:02"},
+            {"id": "d", "url": "https://example.com/d", "title": "D", "duration": True},
+        ]
+        extract = MagicMock(return_value=(info, entries))
+        result, _ = await self._browse(extract)
+
+        self.assertEqual(
+            result,
+            {
+                "status": "ok",
+                "title": "My List",
+                "entries": [
+                    {"url": "https://example.com/a", "title": "A", "duration": 61},
+                    {"url": "https://example.com/b", "title": "https://example.com/b", "duration": 12.5},
+                    {"url": "https://example.com/c", "title": "C", "duration": None},
+                    {"url": "https://example.com/d", "title": "D", "duration": None},
+                ],
+            },
+        )
+
+    async def test_title_falls_back_to_url(self):
+        extract = MagicMock(
+            return_value=({"_type": "channel"}, [{"url": "https://example.com/a"}])
+        )
+        result, _ = await self._browse(extract)
+        self.assertEqual(result["title"], self.URL)
+
+    async def test_skips_non_dict_and_urlless_entries(self):
+        extract = MagicMock(
+            return_value=(
+                {"_type": "playlist", "title": "L"},
+                ["junk", None, {"title": "no url"}, {"url": "https://example.com/ok", "title": "Ok"}],
+            )
+        )
+        result, _ = await self._browse(extract)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual([e["url"] for e in result["entries"]], ["https://example.com/ok"])
+
+    async def test_single_video_is_rejected(self):
+        extract = MagicMock(return_value=({"_type": "video", "title": "V"}, []))
+        result, _ = await self._browse(extract)
+        self.assertEqual(result, {"status": "error", "msg": VIDEO_ONLY_MSG})
+
+    async def test_empty_playlist_is_rejected(self):
+        extract = MagicMock(return_value=({"_type": "playlist", "title": "L"}, []))
+        result, _ = await self._browse(extract)
+        self.assertEqual(result, {"status": "error", "msg": NO_ENTRIES_MSG})
+        self.assertNotEqual(NO_ENTRIES_MSG, VIDEO_ONLY_MSG)
+
+    async def test_playlist_with_only_unusable_entries_is_rejected(self):
+        extract = MagicMock(
+            return_value=({"_type": "channel", "title": "L"}, ["junk", None, {"title": "no url"}])
+        )
+        result, _ = await self._browse(extract)
+        self.assertEqual(result, {"status": "error", "msg": NO_ENTRIES_MSG})
+
+    async def test_blocked_url_never_reaches_the_extractor(self):
+        extract = MagicMock()
+        result, validate = await self._browse(extract, url_error="Blocked address")
+        self.assertEqual(result, {"status": "error", "msg": "Blocked address"})
+        extract.assert_not_called()
+        validate.assert_called_once()
+        self.assertEqual(validate.call_args.args[0], self.URL)
+        self.assertFalse(validate.call_args.kwargs["allow_private"])
+
+    async def test_guard_honours_allow_private_and_scan_proxy(self):
+        cfg = self._config()
+        cfg.ALLOW_PRIVATE_ADDRESSES = True
+        cfg.YTDL_OPTIONS_PRESETS = {"px": {"proxy": "http://proxy.local:3128"}}
+        extract = MagicMock(return_value=({"_type": "playlist"}, [{"url": "https://example.com/a"}]))
+        _, validate = await self._browse(extract, cfg=cfg, presets=["px"])
+        self.assertTrue(validate.call_args.kwargs["allow_private"])
+        self.assertTrue(validate.call_args.kwargs["proxies"])
+
+    async def test_extractor_error_becomes_error_status(self):
+        extract = MagicMock(
+            side_effect=subscriptions.yt_dlp.utils.YoutubeDLError("boom")
+        )
+        result, _ = await self._browse(extract)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("boom", result["msg"])
+
+    async def test_unresolvable_url(self):
+        extract = MagicMock(return_value=(None, []))
+        result, _ = await self._browse(extract)
+        self.assertEqual(result, {"status": "error", "msg": "Could not resolve URL"})
+
+    async def test_limit_zero_means_no_playlistend(self):
+        extract = MagicMock(return_value=({"_type": "playlist"}, [{"url": "https://example.com/a"}]))
+        await self._browse(extract, limit=0)
+        self.assertIsNone(extract.call_args.args[2])
+
+    async def test_negative_limit_means_no_playlistend(self):
+        extract = MagicMock(return_value=({"_type": "playlist"}, [{"url": "https://example.com/a"}]))
+        await self._browse(extract, limit=-3)
+        self.assertIsNone(extract.call_args.args[2])
+
+    async def test_positive_limit_is_passed_as_playlistend(self):
+        extract = MagicMock(return_value=({"_type": "playlist"}, [{"url": "https://example.com/a"}]))
+        await self._browse(extract, limit=5)
+        self.assertEqual(extract.call_args.args[2], 5)
+        self.assertEqual(extract.call_args.args[1], self.URL)
+
+    async def test_presets_and_overrides_are_merged_into_extra_opts(self):
+        cfg = self._config()
+        cfg.YTDL_OPTIONS_PRESETS = {"mypreset": {"cookiefile": "preset.txt", "a": 1}}
+        extract = MagicMock(return_value=({"_type": "playlist"}, [{"url": "https://example.com/a"}]))
+        await self._browse(
+            extract, cfg=cfg, presets=["mypreset"], overrides={"a": 2, "extra": "override"}
+        )
+        self.assertEqual(
+            extract.call_args.kwargs["extra_opts"],
+            {"cookiefile": "preset.txt", "a": 2, "extra": "override"},
+        )
+
+    async def test_probe_suppresses_playlist_sidecar_files(self):
+        """Through the real extractor: no playlist-level files are written."""
+        captured_params: list = []
+        fake_ydl = _make_scan_capturing_fake_ydl(
+            captured_params, [{"id": "v1", "title": "One", "webpage_url": "https://example.com/v1"}]
+        )
+        cfg = self._config()
+        cfg.YTDL_OPTIONS = {"writeinfojson": True}
+        with patch("subscriptions.validate_url", return_value=None), patch(
+            "subscriptions.yt_dlp.YoutubeDL", fake_ydl, create=True
+        ):
+            result = await browse_playlist(cfg, self.URL, 0, None, None)
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(captured_params[0]["allow_playlist_files"])
+        self.assertNotIn("playlistend", captured_params[0])
+
+
 class SubscriptionEventLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_check_now_does_not_block_event_loop(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1554,3 +1821,24 @@ class SubscriptionEventLoopTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SubscriptionMutateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_save_restores_the_subscription(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = SubscriptionManager(_Config(tmp), _Queue(), _Notifier())
+            sub = SubscriptionInfo(id="s1", name="Before", url="https://example.com/c")
+            mgr._subs[sub.id] = sub
+
+            with patch.object(mgr, "_save_locked", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    await mgr.update_subscription("s1", {"name": "After", "enabled": False})
+
+            self.assertEqual(mgr.get("s1").name, "Before")
+            self.assertTrue(mgr.get("s1").enabled)
+
+    async def test_update_of_a_deleted_subscription_reports_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = SubscriptionManager(_Config(tmp), _Queue(), _Notifier())
+            result = await mgr.update_subscription("gone", {"name": "x"})
+            self.assertEqual(result, {"status": "error", "msg": "Subscription not found"})

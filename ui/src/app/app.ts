@@ -1,41 +1,41 @@
-import { DatePipe, KeyValuePipe, NgTemplateOutlet } from '@angular/common';
+import { NgTemplateOutlet } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
-import { AfterViewInit, ChangeDetectionStrategy, ChangeDetectorRef, Component, DestroyRef, ElementRef, viewChild, inject, OnDestroy, OnInit } from '@angular/core';
-import { Observable, OperatorFunction, Subject, Subscription, from, map, merge, debounceTime, distinctUntilChanged, filter, finalize, mergeMap, takeUntil, tap } from 'rxjs';
+import { AfterViewInit, ChangeDetectionStrategy, ChangeDetectorRef, Component, DestroyRef, viewChild, inject, OnDestroy, OnInit } from '@angular/core';
+import { Observable, OperatorFunction, Subject, Subscription, from, map, merge, debounceTime, distinctUntilChanged, filter, finalize, mergeMap, tap } from 'rxjs';
 import { FormsModule } from '@angular/forms';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { FontAwesomeModule } from '@fortawesome/angular-fontawesome';
-import { NgbModule, NgbTypeahead } from '@ng-bootstrap/ng-bootstrap';
+import { NgbModal, NgbModule, NgbTypeahead } from '@ng-bootstrap/ng-bootstrap';
 import { NgSelectModule } from '@ng-select/ng-select';
-import { faTrashAlt, faCheckCircle, faTimesCircle, faRedoAlt, faSun, faMoon, faCheck, faCircleHalfStroke, faDownload, faExternalLinkAlt, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faSortAmountDown, faSortAmountUp, faChevronRight, faChevronDown, faUpload, faPause, faPlay, faShareNodes, faGear, faUsers, faUser, faRightFromBracket, faLink } from '@fortawesome/free-solid-svg-icons';
+import { faTrashAlt, faCheckCircle, faTimesCircle, faCheck, faDownload, faExternalLinkAlt, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faChevronRight, faChevronDown, faUpload, faGear, faUsers, faUser, faRightFromBracket, faLink } from '@fortawesome/free-solid-svg-icons';
 import { faGithub } from '@fortawesome/free-brands-svg-icons';
 import { CookieService } from 'ngx-cookie-service';
-import { AddDownloadPayload, DownloadsService, ServerSettings, ServerSettingsChanges } from './services/downloads.service';
+import { ADD_REQUEST_CONCURRENCY, AddDownloadPayload, DownloadsService, ServerSettings, ServerSettingsChanges } from './services/downloads.service';
 import { AuthService, AuthUser, UserRole } from './services/auth.service';
 import { MeTubeSocket } from './services/metube-socket.service';
 import { SubscriptionsService } from './services/subscriptions.service';
 import { ToastService } from './services/toast.service';
 import { BatchUrlsService, BatchUrlFilter } from './services/batch-urls.service';
-import { SubscriptionRow } from './interfaces/subscription';
+import { SettingsStore } from './services/settings-store.service';
 import { Themes } from './theme';
 import {
-  Download,
   Status,
   Theme,
-  Quality,
   Option,
-  AudioFormatOption,
-  DOWNLOAD_TYPES,
-  VIDEO_CODECS,
-  VIDEO_FORMATS,
-  VIDEO_QUALITIES,
-  AUDIO_FORMATS,
-  CAPTION_FORMATS,
-  THUMBNAIL_FORMATS,
-  State,
+  Choice,
+  DownloadTypeOption,
+  FormatCatalog,
+  FormatOption,
 } from './interfaces';
-import { EtaPipe, SpeedPipe, FileSizePipe } from './pipes';
-import { SelectAllCheckboxComponent, ItemCheckboxComponent, ToastContainerComponent } from './components/';
+import { SpeedPipe } from './pipes';
+import {
+  ToastContainerComponent,
+  PlaylistBrowserComponent,
+  SubscriptionsSectionComponent,
+  BatchImportComponent,
+  DownloadingSectionComponent,
+  CompletedSectionComponent,
+} from './components/';
 
 @Component({
   selector: 'app-root',
@@ -43,17 +43,14 @@ import { SelectAllCheckboxComponent, ItemCheckboxComponent, ToastContainerCompon
   imports: [
         FormsModule,
         NgTemplateOutlet,
-        KeyValuePipe,
-        DatePipe,
         FontAwesomeModule,
         NgbModule,
         NgSelectModule,
-        EtaPipe,
         SpeedPipe,
-        FileSizePipe,
-        SelectAllCheckboxComponent,
-        ItemCheckboxComponent,
         ToastContainerComponent,
+        SubscriptionsSectionComponent,
+        DownloadingSectionComponent,
+        CompletedSectionComponent,
   ],
   templateUrl: './app.html',
   styleUrl: './app.sass',
@@ -66,19 +63,24 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   private batchUrls = inject(BatchUrlsService);
   private socket = inject(MeTubeSocket);
   private cookieService = inject(CookieService);
+  private settings = inject(SettingsStore);
   private http = inject(HttpClient);
   private cdr = inject(ChangeDetectorRef);
   private destroyRef = inject(DestroyRef);
+  private modal = inject(NgbModal);
 
   addUrl!: string;
-  downloadTypes: Option[] = DOWNLOAD_TYPES;
-  videoCodecs: Option[] = VIDEO_CODECS;
-  videoFormats: Option[] = VIDEO_FORMATS;
-  audioFormats: AudioFormatOption[] = AUDIO_FORMATS;
-  captionFormats: Option[] = CAPTION_FORMATS;
-  thumbnailFormats: Option[] = THUMBNAIL_FORMATS;
-  formatOptions: Option[] = [];
-  qualities!: Quality[];
+  // The server's catalog of download options (app/format_catalog.py); the
+  // form is not shown until it arrives. The lists below are the parts of it
+  // the form is currently showing.
+  catalog: FormatCatalog | null = null;
+  downloadTypes: DownloadTypeOption[] = [];
+  codecOptions: Option[] = [];
+  formatOptions: FormatOption[] = [];
+  qualities: Option[] = [];
+  audioTagsOptions: Option[] = [];
+  subtitleLanguages: Option[] = [];
+  subtitleModes: Option[] = [];
   downloadType: string;
   codec: string;
   quality: string;
@@ -89,9 +91,11 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   playlistItemLimit!: number;
   splitByChapters: boolean;
   sponsorblock: boolean;
+  audioTags: string;
   chapterTemplate: string;
   clipStart = '';
   clipEnd = '';
+  videoPassword = '';
   subtitleLanguage: string;
   subtitleMode: string;
   ytdlOptionsPresets: string[] = [];
@@ -103,16 +107,6 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   checkIntervalMinutes = 60;
   titleRegex = '';
   skipSubscriberOnly = false;
-  editingTitleRegexId: string | null = null;
-  titleRegexEditDraft = '';
-  editingNameId: string | null = null;
-  nameEditDraft = '';
-  readonly subscriptionNameMaxLength = 200;
-  cachedSubs: [string, SubscriptionRow][] = [];
-  selectedSubscriptionIds = new Set<string>();
-  checkingSubscriptionIds = new Set<string>();
-  checkingAllSubscriptions = false;
-  checkingSelectedSubscriptions = false;
   hasCookies = false;
 
   // Which top-level view is shown. 'login' replaces everything until a session exists.
@@ -132,7 +126,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   usersBusy = false;
 
   // Settings page (runtime-editable settings, see /settings) and the direct-link builder
-  settings: ServerSettings | null = null;
+  serverSettings: ServerSettings | null = null;
   settingsSaving = false;
   settingsError = '';
   linkSource = 'PVtSAXSv7Fo';
@@ -147,36 +141,12 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   readonly folderTypeahead = viewChild<NgbTypeahead>('folderTypeahead');
   folderFocus$ = new Subject<string>();
   folderClick$ = new Subject<string>();
-  showBatchPanel = false;
-  batchImportModalOpen = false;
-  batchImportText = '';
-  batchImportStatus = '';
-  batchImportCount = 0;
-  batchImportTotal = 0;
-  batchImportFailures = 0;
-  importInProgress = false;
-  private batchImportCancel$ = new Subject<void>();
-  // Maximum number of /add requests to have in-flight at once during a batch
-  // import. Keeps the server from being hit with hundreds of simultaneous
-  // yt-dlp metadata extractions when a user pastes a huge URL list.
-  private static readonly BATCH_IMPORT_CONCURRENCY = 4;
   ytDlpOptionsUpdateTime: string | null = null;
   ytDlpVersion: string | null = null;
   metubeVersion: string | null = null;
   isAdvancedOpen = false;
-  sortAscending = false;
-  downloadingCollapsed = false;
-  completedCollapsed = false;
-  subscriptionsCollapsed = false;
-  expandedErrors: Set<string> = new Set<string>();
-  cachedSortedDone: [string, Download][] = [];
-  // The done ids in rendered order, so a shift-click range follows the sort
-  // the user is looking at rather than the map's insertion order.
-  cachedSortedDoneIds: string[] = [];
-  lastCopiedErrorId: string | null = null;
-  private previousDownloadType = 'video';
+  private previousDownloadType = '';
   private addRequestSub?: Subscription;
-  private liveCountdownTimer?: ReturnType<typeof setInterval>;
   private selectionsByType: Record<string, {
     codec: string;
     format: string;
@@ -184,9 +154,10 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     subtitleLanguage: string;
     subtitleMode: string;
   }> = {};
-  private readonly selectionCookiePrefix = 'metube_selection_';
-  private readonly settingsCookieExpiryDays = 3650;
-  private lastFocusedElement: HTMLElement | null = null;
+  private readonly selectionKeyPrefix = 'metube_selection_';
+  // The theme is the one setting kept in a cookie: the server sets it to
+  // DEFAULT_THEME on a first visit. Everything else is in SettingsStore.
+  private static readonly THEME_COOKIE_EXPIRY_DAYS = 3650;
   private colorSchemeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
   private onColorSchemeChanged = () => {
     if (this.activeTheme && this.activeTheme.id === 'auto') {
@@ -200,137 +171,55 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   completedDownloads = 0;
   failedDownloads = 0;
   totalSpeed = 0;
-  hasCompletedDone = false;
-  hasFailedDone = false;
 
-  readonly queueMasterCheckbox = viewChild<SelectAllCheckboxComponent>('queueMasterCheckboxRef');
-  readonly queueDelSelected = viewChild.required<ElementRef>('queueDelSelected');
-  readonly queueDownloadSelected = viewChild.required<ElementRef>('queueDownloadSelected');
-  readonly doneMasterCheckbox = viewChild<SelectAllCheckboxComponent>('doneMasterCheckboxRef');
-  readonly doneDelSelected = viewChild.required<ElementRef>('doneDelSelected');
-  readonly doneDownloadSelected = viewChild.required<ElementRef>('doneDownloadSelected');
 
   faTrashAlt = faTrashAlt;
   faCheckCircle = faCheckCircle;
   faTimesCircle = faTimesCircle;
-  faRedoAlt = faRedoAlt;
-  faSun = faSun;
-  faMoon = faMoon;
   faCheck = faCheck;
-  faCircleHalfStroke = faCircleHalfStroke;
   faDownload = faDownload;
-  faExternalLinkAlt = faExternalLinkAlt;
   faFileImport = faFileImport;
   faFileExport = faFileExport;
   faCopy = faCopy;
   faGithub = faGithub;
   faClock = faClock;
   faTachometerAlt = faTachometerAlt;
-  faSortAmountDown = faSortAmountDown;
-  faSortAmountUp = faSortAmountUp;
   faChevronRight = faChevronRight;
   faChevronDown = faChevronDown;
   faUpload = faUpload;
+  faExternalLinkAlt = faExternalLinkAlt;
   faGear = faGear;
   faUsers = faUsers;
   faUser = faUser;
   faRightFromBracket = faRightFromBracket;
   faLink = faLink;
-  faPause = faPause;
-  faPlay = faPlay;
-  faShareNodes = faShareNodes;
-  subtitleLanguages = [
-    { id: 'en', text: 'English' },
-    { id: 'ar', text: 'Arabic' },
-    { id: 'bn', text: 'Bengali' },
-    { id: 'bg', text: 'Bulgarian' },
-    { id: 'ca', text: 'Catalan' },
-    { id: 'cs', text: 'Czech' },
-    { id: 'da', text: 'Danish' },
-    { id: 'nl', text: 'Dutch' },
-    { id: 'es', text: 'Spanish' },
-    { id: 'et', text: 'Estonian' },
-    { id: 'fi', text: 'Finnish' },
-    { id: 'fr', text: 'French' },
-    { id: 'de', text: 'German' },
-    { id: 'el', text: 'Greek' },
-    { id: 'he', text: 'Hebrew' },
-    { id: 'hi', text: 'Hindi' },
-    { id: 'hu', text: 'Hungarian' },
-    { id: 'id', text: 'Indonesian' },
-    { id: 'it', text: 'Italian' },
-    { id: 'lt', text: 'Lithuanian' },
-    { id: 'lv', text: 'Latvian' },
-    { id: 'ms', text: 'Malay' },
-    { id: 'no', text: 'Norwegian' },
-    { id: 'pl', text: 'Polish' },
-    { id: 'pt', text: 'Portuguese' },
-    { id: 'pt-BR', text: 'Portuguese (Brazil)' },
-    { id: 'ro', text: 'Romanian' },
-    { id: 'ru', text: 'Russian' },
-    { id: 'sk', text: 'Slovak' },
-    { id: 'sl', text: 'Slovenian' },
-    { id: 'sr', text: 'Serbian' },
-    { id: 'sv', text: 'Swedish' },
-    { id: 'ta', text: 'Tamil' },
-    { id: 'te', text: 'Telugu' },
-    { id: 'th', text: 'Thai' },
-    { id: 'tr', text: 'Turkish' },
-    { id: 'uk', text: 'Ukrainian' },
-    { id: 'ur', text: 'Urdu' },
-    { id: 'vi', text: 'Vietnamese' },
-    { id: 'ja', text: 'Japanese' },
-    { id: 'ko', text: 'Korean' },
-    { id: 'zh-Hans', text: 'Chinese (Simplified)' },
-    { id: 'zh-Hant', text: 'Chinese (Traditional)' },
-  ];
-  subtitleModes = [
-    { id: 'prefer_manual', text: 'Prefer Manual' },
-    { id: 'prefer_auto', text: 'Prefer Auto' },
-    { id: 'manual_only', text: 'Manual Only' },
-    { id: 'auto_only', text: 'Auto Only' },
-  ];
   constructor() {
-    this.downloadType = this.cookieService.get('metube_download_type') || 'video';
-    this.codec = this.cookieService.get('metube_codec') || 'auto';
-    this.format = this.cookieService.get('metube_format') || 'any';
-    this.quality = this.cookieService.get('metube_quality') || 'best';
-    this.autoStart = this.cookieService.get('metube_auto_start') !== 'false';
-    this.splitByChapters = this.cookieService.get('metube_split_chapters') === 'true';
-    this.sponsorblock = this.cookieService.get('metube_sponsorblock') === 'true';
+    // Remembered choices are checked against the catalog when it arrives.
+    this.downloadType = this.settings.get('metube_download_type');
+    this.codec = this.settings.get('metube_codec');
+    this.format = this.settings.get('metube_format');
+    this.quality = this.settings.get('metube_quality');
+    this.autoStart = this.settings.get('metube_auto_start') !== 'false';
+    this.splitByChapters = this.settings.get('metube_split_chapters') === 'true';
+    this.sponsorblock = this.settings.get('metube_sponsorblock') === 'true';
+    this.audioTags = this.settings.get('metube_audio_tags');
     // Will be set from backend configuration, use empty string as placeholder
-    this.chapterTemplate = this.cookieService.get('metube_chapter_template') || '';
-    this.clipStart = this.cookieService.get('metube_clip_start') || '';
-    this.clipEnd = this.cookieService.get('metube_clip_end') || '';
-    this.subtitleLanguage = this.cookieService.get('metube_subtitle_language') || 'en';
-    this.subtitleMode = this.cookieService.get('metube_subtitle_mode') || 'prefer_manual';
-    this.ytdlOptionsPresets = this.loadYtdlOptionsPresetsFromCookie();
-    this.ytdlOptionsOverrides = this.cookieService.get('metube_ytdl_options_overrides') || '';
-    const allowedDownloadTypes = new Set(this.downloadTypes.map(t => t.id));
-    const allowedVideoCodecs = new Set(this.videoCodecs.map(c => c.id));
-    if (!allowedDownloadTypes.has(this.downloadType)) {
-      this.downloadType = 'video';
+    this.chapterTemplate = this.settings.get('metube_chapter_template') || '';
+    this.clipStart = this.settings.get('metube_clip_start') || '';
+    this.clipEnd = this.settings.get('metube_clip_end') || '';
+    this.subtitleLanguage = this.settings.get('metube_subtitle_language');
+    this.subtitleMode = this.settings.get('metube_subtitle_mode');
+    this.ytdlOptionsPresets = this.loadStoredYtdlOptionsPresets();
+    this.ytdlOptionsOverrides = this.settings.get('metube_ytdl_options_overrides') || '';
+    if (this.downloads.formats) {
+      this.applyCatalog(this.downloads.formats);
     }
-    if (!allowedVideoCodecs.has(this.codec)) {
-      this.codec = 'auto';
-    }
-    const allowedSubtitleModes = new Set(this.subtitleModes.map(mode => mode.id));
-    if (!allowedSubtitleModes.has(this.subtitleMode)) {
-      this.subtitleMode = 'prefer_manual';
-    }
-    this.loadSavedSelections();
-    this.restoreSelection(this.downloadType);
-    this.normalizeSelectionsForType();
-    this.setQualities();
-    this.refreshFormatOptions();
-    this.previousDownloadType = this.downloadType;
-    this.saveSelection(this.downloadType);
-    this.sortAscending = this.cookieService.get('metube_sort_ascending') === 'true';
-    this.downloadingCollapsed = this.cookieService.get('metube_downloading_collapsed') === 'true';
-    this.completedCollapsed = this.cookieService.get('metube_completed_collapsed') === 'true';
-    this.subscriptionsCollapsed = this.cookieService.get('metube_subscriptions_collapsed') === 'true';
+    this.downloads.formatsChanged.pipe(takeUntilDestroyed(this.destroyRef)).subscribe((catalog) => {
+      this.applyCatalog(catalog);
+      this.cdr.markForCheck();
+    });
 
-    const ci = parseInt(this.cookieService.get('metube_check_interval') || '', 10);
+    const ci = parseInt(this.settings.get('metube_check_interval') || '', 10);
     if (!Number.isNaN(ci) && ci >= 1) {
       this.checkIntervalMinutes = ci;
     }
@@ -339,25 +228,18 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     // Subscribe to download updates
     this.downloads.queueChanged.pipe(takeUntilDestroyed(this.destroyRef)).subscribe(() => {
       this.updateMetrics();
-      this.syncLiveCountdownTimer();
       this.cdr.markForCheck();
     });
     this.downloads.doneChanged.pipe(takeUntilDestroyed(this.destroyRef)).subscribe(() => {
       this.updateMetrics();
-      this.rebuildSortedDone();
       this.cdr.markForCheck();
     });
     // Subscribe to real-time updates
     this.downloads.updated.pipe(takeUntilDestroyed(this.destroyRef)).subscribe(() => {
       this.updateMetrics();
-      this.syncLiveCountdownTimer();
       this.cdr.markForCheck();
     });
 
-    this.subscriptionsSvc.subscriptionsChanged.pipe(takeUntilDestroyed(this.destroyRef)).subscribe(() => {
-      this.rebuildCachedSubs();
-      this.cdr.markForCheck();
-    });
   }
 
   ngOnInit() {
@@ -381,17 +263,8 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   }
 
   ngAfterViewInit() {
-    this.downloads.queueChanged.pipe(takeUntilDestroyed(this.destroyRef)).subscribe(() => {
-      this.queueMasterCheckbox()?.selectionChanged();
-      this.cdr.markForCheck();
-    });
-    this.downloads.doneChanged.pipe(takeUntilDestroyed(this.destroyRef)).subscribe(() => {
-      this.doneMasterCheckbox()?.selectionChanged();
-      this.updateDoneActionButtons();
-      this.cdr.markForCheck();
-    });
-    // Initialize action button states for already-loaded entries.
-    this.updateDoneActionButtons();
+    // Counts and action button states for already-loaded entries.
+    this.updateMetrics();
     this.fetchVersionInfo();
     this.socket.fromEvent('connect')
       .pipe(takeUntilDestroyed(this.destroyRef))
@@ -400,39 +273,27 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
 
   ngOnDestroy() {
     this.addRequestSub?.unsubscribe();
-    if (this.liveCountdownTimer) {
-      clearInterval(this.liveCountdownTimer);
-    }
     this.colorSchemeMediaQuery.removeEventListener('change', this.onColorSchemeChanged);
   }
 
-  // keyvalue comparator that preserves insertion order (Angular's keyvalue
-  // pipe sorts by key by default): https://github.com/angular/angular/issues/31420
-  asIsOrder() {
-    return 0;
-  }
-
   qualityChanged() {
-    this.cookieService.set('metube_quality', this.quality, { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_quality', this.quality);
     this.saveSelection(this.downloadType);
-    // Re-trigger custom directory change
-    this.downloads.customDirsChanged.next(this.downloads.customDirs);
   }
 
   downloadTypeChanged() {
     this.saveSelection(this.previousDownloadType);
     this.restoreSelection(this.downloadType);
-    this.cookieService.set('metube_download_type', this.downloadType, { expires: this.settingsCookieExpiryDays });
-    this.normalizeSelectionsForType(false);
+    this.settings.set('metube_download_type', this.downloadType);
+    this.normalizeSelectionsForType();
     this.setQualities();
     this.refreshFormatOptions();
     this.saveSelection(this.downloadType);
     this.previousDownloadType = this.downloadType;
-    this.downloads.customDirsChanged.next(this.downloads.customDirs);
   }
 
   codecChanged() {
-    this.cookieService.set('metube_codec', this.codec, { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_codec', this.codec);
     this.saveSelection(this.downloadType);
   }
 
@@ -492,11 +353,11 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
         if (!this.folder) {
           this.folder = String(config['DEFAULT_FOLDER'] ?? '');
         }
-        // Set chapter template from backend config if not already set by cookie
+        // Set chapter template from backend config if not already remembered
         if (!this.chapterTemplate) {
           this.chapterTemplate = config['OUTPUT_TEMPLATE_CHAPTER'];
         }
-        if (!this.cookieService.check('metube_check_interval')) {
+        if (!this.settings.has('metube_check_interval')) {
           const dci = parseInt(String(config['SUBSCRIPTION_DEFAULT_CHECK_INTERVAL'] ?? 60), 10);
           if (!Number.isNaN(dci) && dci >= 1) {
             this.checkIntervalMinutes = dci;
@@ -526,19 +387,19 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     });
   }
 
-  private loadYtdlOptionsPresetsFromCookie(): string[] {
-    const jsonCookie = this.cookieService.get('metube_ytdl_options_presets');
-    if (jsonCookie) {
+  private loadStoredYtdlOptionsPresets(): string[] {
+    const stored = this.settings.get('metube_ytdl_options_presets');
+    if (stored) {
       try {
-        const parsed = JSON.parse(jsonCookie) as unknown;
+        const parsed = JSON.parse(stored) as unknown;
         if (Array.isArray(parsed)) {
           return parsed.filter((p): p is string => typeof p === 'string' && p.length > 0);
         }
       } catch {
-        // fall through to legacy cookie
+        // fall through to the legacy single-preset value
       }
     }
-    const legacy = this.cookieService.get('metube_ytdl_options_preset')?.trim();
+    const legacy = this.settings.get('metube_ytdl_options_preset')?.trim();
     return legacy ? [legacy] : [];
   }
 
@@ -563,75 +424,8 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     return true;
   }
 
-  private rebuildCachedSubs() {
-    this.cachedSubs = Array.from(this.subscriptionsSvc.subscriptions.entries());
-    const validIds = new Set(this.cachedSubs.map(([id]) => id));
-    for (const id of [...this.selectedSubscriptionIds]) {
-      if (!validIds.has(id)) {
-        this.selectedSubscriptionIds.delete(id);
-      }
-    }
-  }
-
   checkIntervalChanged() {
-    this.cookieService.set('metube_check_interval', String(this.checkIntervalMinutes), {
-      expires: this.settingsCookieExpiryDays,
-    });
-  }
-
-  private getStatusError(res: unknown): string | null {
-    const status = res as { status?: string; msg?: string };
-    return status?.status === 'error' ? status.msg || null : null;
-  }
-
-  private handleActionResult(res: unknown, fallbackMsg: string) {
-    const error = this.getStatusError(res);
-    if (error) {
-      this.toasts.error(error || fallbackMsg);
-    }
-    this.cdr.markForCheck();
-  }
-
-  private refreshSubscriptionsWithAlert() {
-    this.subscriptionsSvc.refreshList().pipe(takeUntilDestroyed(this.destroyRef)).subscribe((refreshRes) => {
-      const error = this.getStatusError(refreshRes);
-      if (error) {
-        this.toasts.error(error || 'Refresh subscriptions failed');
-        return;
-      }
-      this.cdr.markForCheck();
-    });
-  }
-
-  isSubSelected(id: string): boolean {
-    return this.selectedSubscriptionIds.has(id);
-  }
-
-  toggleSubSelected(id: string) {
-    if (this.selectedSubscriptionIds.has(id)) {
-      this.selectedSubscriptionIds.delete(id);
-    } else {
-      this.selectedSubscriptionIds.add(id);
-    }
-    this.cdr.markForCheck();
-  }
-
-  toggleSubMaster(event: Event) {
-    const checked = (event.target as HTMLInputElement).checked;
-    this.selectedSubscriptionIds.clear();
-    if (checked) {
-      for (const [id] of this.cachedSubs) {
-        this.selectedSubscriptionIds.add(id);
-      }
-    }
-    this.cdr.markForCheck();
-  }
-
-  allSubsSelected(): boolean {
-    if (this.cachedSubs.length === 0) {
-      return false;
-    }
-    return this.cachedSubs.every(([id]) => this.selectedSubscriptionIds.has(id));
+    this.settings.set('metube_check_interval', String(this.checkIntervalMinutes));
   }
 
   addSubscription() {
@@ -688,187 +482,6 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
       });
   }
 
-  beginEditTitleRegex(id: string, current: string | undefined) {
-    this.editingTitleRegexId = id;
-    this.titleRegexEditDraft = current ?? '';
-    this.cdr.markForCheck();
-  }
-
-  cancelEditTitleRegex() {
-    this.editingTitleRegexId = null;
-    this.titleRegexEditDraft = '';
-    this.cdr.markForCheck();
-  }
-
-  saveTitleRegex(id: string) {
-    const raw = (this.titleRegexEditDraft || '').trim();
-    if (raw) {
-      try {
-        void RegExp(raw);
-      } catch {
-        this.toasts.error('Invalid subscription title filter (regex)');
-        return;
-      }
-    }
-    this.subscriptionsSvc.update(id, { title_regex: raw }).subscribe((res) => {
-      const error = this.getStatusError(res);
-      if (error) {
-        this.toasts.error(error || 'Update subscription failed');
-        return;
-      }
-      this.cancelEditTitleRegex();
-    });
-  }
-
-  beginEditName(id: string, current: string | undefined) {
-    this.editingNameId = id;
-    this.nameEditDraft = current ?? '';
-    this.cdr.markForCheck();
-  }
-
-  cancelEditName() {
-    this.editingNameId = null;
-    this.nameEditDraft = '';
-    this.cdr.markForCheck();
-  }
-
-  saveName(id: string) {
-    const name = (this.nameEditDraft || '').trim();
-    if (!name) {
-      this.toasts.error('Subscription name must not be empty');
-      return;
-    }
-    this.subscriptionsSvc.update(id, { name }).subscribe((res) => {
-      const error = this.getStatusError(res);
-      if (error) {
-        this.toasts.error(error || 'Update subscription failed');
-        return;
-      }
-      this.cancelEditName();
-    });
-  }
-
-  deleteSubscription(id: string) {
-    this.subscriptionsSvc.delete([id]).subscribe((res) => {
-      const error = this.getStatusError(res);
-      if (error) {
-        this.toasts.error(error || 'Delete subscription failed');
-        return;
-      }
-      this.selectedSubscriptionIds.delete(id);
-      this.cdr.markForCheck();
-    });
-  }
-
-  deleteSelectedSubscriptions() {
-    const ids = Array.from(this.selectedSubscriptionIds);
-    if (!ids.length) {
-      return;
-    }
-    this.subscriptionsSvc.delete(ids).subscribe((res) => {
-      const error = this.getStatusError(res);
-      if (error) {
-        this.toasts.error(error || 'Delete subscriptions failed');
-        return;
-      }
-      this.selectedSubscriptionIds.clear();
-      this.cdr.markForCheck();
-    });
-  }
-
-  checkSubscriptionNow(id: string) {
-    if (this.checkingSubscriptionIds.has(id)) {
-      return;
-    }
-    this.checkingSubscriptionIds.add(id);
-    this.cdr.markForCheck();
-    this.subscriptionsSvc
-      .checkNow([id])
-      .pipe(
-        takeUntilDestroyed(this.destroyRef),
-        finalize(() => {
-          this.checkingSubscriptionIds.delete(id);
-          this.cdr.markForCheck();
-        }),
-      )
-      .subscribe((res) => {
-        const error = this.getStatusError(res);
-        if (error) {
-          this.toasts.error(error || 'Subscription check failed');
-          return;
-        }
-        this.refreshSubscriptionsWithAlert();
-      });
-  }
-
-  isSubscriptionChecking(id: string): boolean {
-    return this.checkingSubscriptionIds.has(id);
-  }
-
-  private runBulkSubscriptionCheck(ids: string[] | undefined, mode: 'all' | 'selected') {
-    const targetIds = ids ?? this.cachedSubs.filter(([, row]) => row.enabled).map(([id]) => id);
-    if (!targetIds.length) {
-      return;
-    }
-
-    const checkedIds = new Set(targetIds);
-    for (const id of checkedIds) {
-      this.checkingSubscriptionIds.add(id);
-    }
-    if (mode === 'all') {
-      this.checkingAllSubscriptions = true;
-    } else {
-      this.checkingSelectedSubscriptions = true;
-    }
-    this.cdr.markForCheck();
-
-    this.subscriptionsSvc
-      .checkNow(ids)
-      .pipe(
-        takeUntilDestroyed(this.destroyRef),
-        finalize(() => {
-          for (const id of checkedIds) {
-            this.checkingSubscriptionIds.delete(id);
-          }
-          if (mode === 'all') {
-            this.checkingAllSubscriptions = false;
-          } else {
-            this.checkingSelectedSubscriptions = false;
-          }
-          this.cdr.markForCheck();
-        }),
-      )
-      .subscribe((res) => {
-        const error = this.getStatusError(res);
-        if (error) {
-          this.toasts.error(error || 'Subscription check failed');
-          return;
-        }
-        this.refreshSubscriptionsWithAlert();
-      });
-  }
-
-  checkSelectedSubscriptions() {
-    const ids = Array.from(this.selectedSubscriptionIds);
-    if (!ids.length) {
-      return;
-    }
-    this.runBulkSubscriptionCheck(ids, 'selected');
-  }
-
-  checkAllSubscriptions() {
-    this.runBulkSubscriptionCheck(undefined, 'all');
-  }
-
-  toggleSubscriptionEnabled(row: SubscriptionRow) {
-    this.subscriptionsSvc.update(row.id, { enabled: !row.enabled }).subscribe((res) => {
-      const error = this.getStatusError(res);
-      if (error) {
-        this.toasts.error(error || 'Update subscription failed');
-      }
-    });
-  }
-
   getPreferredTheme(cookieService: CookieService) {
     let theme = 'auto';
     if (cookieService.check('metube_theme')) {
@@ -879,7 +492,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   }
 
   themeChanged(theme: Theme) {
-    this.cookieService.set('metube_theme', theme.id, { expires: this.settingsCookieExpiryDays });
+    this.cookieService.set('metube_theme', theme.id, { expires: App.THEME_COOKIE_EXPIRY_DAYS });
     this.setTheme(theme);
   }
 
@@ -893,23 +506,37 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   }
 
   formatChanged() {
-    this.cookieService.set('metube_format', this.format, { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_format', this.format);
     this.setQualities();
     this.saveSelection(this.downloadType);
-    // Re-trigger custom directory change
-    this.downloads.customDirsChanged.next(this.downloads.customDirs);
   }
 
   autoStartChanged() {
-    this.cookieService.set('metube_auto_start', this.autoStart ? 'true' : 'false', { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_auto_start', this.autoStart ? 'true' : 'false');
+  }
+
+  audioTagsChanged(value: string) {
+    this.audioTags = value;
+    this.settings.set('metube_audio_tags', this.audioTags);
+  }
+
+  // Whether the selected audio format can carry tags (the catalog's flag).
+  tagsSupported(): boolean {
+    return this.selectedFormat()?.tags !== false;
+  }
+
+  // A format that cannot carry tags shows None (disabled) without overwriting
+  // the saved choice for the other formats.
+  displayedAudioTags(): string {
+    return this.tagsSupported() ? this.audioTags : 'none';
   }
 
   sponsorblockChanged() {
-    this.cookieService.set('metube_sponsorblock', this.sponsorblock ? 'true' : 'false', { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_sponsorblock', this.sponsorblock ? 'true' : 'false');
   }
 
   splitByChaptersChanged() {
-    this.cookieService.set('metube_split_chapters', this.splitByChapters ? 'true' : 'false', { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_split_chapters', this.splitByChapters ? 'true' : 'false');
   }
 
   chapterTemplateChanged() {
@@ -918,188 +545,157 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
       const configuredTemplate = this.downloads.configuration['OUTPUT_TEMPLATE_CHAPTER'];
       this.chapterTemplate = typeof configuredTemplate === 'string' ? configuredTemplate : '';
     }
-    this.cookieService.set('metube_chapter_template', this.chapterTemplate, { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_chapter_template', this.chapterTemplate);
   }
 
   clipStartChanged() {
-    this.cookieService.set('metube_clip_start', this.clipStart, { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_clip_start', this.clipStart);
   }
 
   clipEndChanged() {
-    this.cookieService.set('metube_clip_end', this.clipEnd, { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_clip_end', this.clipEnd);
   }
 
   subtitleLanguageChanged() {
-    this.cookieService.set('metube_subtitle_language', this.subtitleLanguage, { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_subtitle_language', this.subtitleLanguage);
     this.saveSelection(this.downloadType);
   }
 
   subtitleModeChanged() {
-    this.cookieService.set('metube_subtitle_mode', this.subtitleMode, { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_subtitle_mode', this.subtitleMode);
     this.saveSelection(this.downloadType);
   }
 
   ytdlOptionsPresetsChanged() {
-    this.cookieService.set(
-      'metube_ytdl_options_presets',
-      JSON.stringify(this.ytdlOptionsPresets ?? []),
-      { expires: this.settingsCookieExpiryDays },
-    );
+    this.settings.set('metube_ytdl_options_presets', JSON.stringify(this.ytdlOptionsPresets ?? []));
   }
 
   ytdlOptionsOverridesChanged() {
-    this.cookieService.set('metube_ytdl_options_overrides', this.ytdlOptionsOverrides, { expires: this.settingsCookieExpiryDays });
+    this.settings.set('metube_ytdl_options_overrides', this.ytdlOptionsOverrides);
   }
 
   isVideoType() {
     return this.downloadType === 'video';
   }
 
-  formatQualityLabel(download: Download): string {
-    if (download.download_type === 'captions' || download.download_type === 'thumbnail') {
-      return '-';
-    }
-    const q = download.quality;
-    if (!q) return '';
-    if (/^\d+$/.test(q) && download.download_type === 'audio') return `${q} kbps`;
-    if (/^\d+$/.test(q)) return `${q}p`;
-    return q.charAt(0).toUpperCase() + q.slice(1);
-  }
-
-  downloadTypeLabel(download: Download): string {
-    const type = download.download_type || 'video';
-    return type.charAt(0).toUpperCase() + type.slice(1);
-  }
-
-  // The format the download was queued with, labelled the way the form labels
-  // it, so a queued item can be told apart while it is still downloading.
-  formatLabel(download: Download): string {
-    const format = (download.format || '').trim();
-    if (!format) {
-      return '-';
-    }
-    const options: Option[] = [
-      ...this.videoFormats,
-      ...this.audioFormats,
-      ...this.captionFormats,
-      ...this.thumbnailFormats,
-    ];
-    return options.find(o => o.id === format)?.text ?? format.toUpperCase();
-  }
-
-  formatCodecLabel(download: Download): string {
-    if (download.download_type !== 'video') {
-      const format = (download.format || '').toUpperCase();
-      return format || '-';
-    }
-    const codec = download.codec;
-    if (!codec || codec === 'auto') return 'Auto';
-    return this.videoCodecs.find(c => c.id === codec)?.text ?? codec;
-  }
-
-  queueSelectionChanged(checked: number) {
-    this.queueDelSelected().nativeElement.disabled = checked === 0;
-    this.queueDownloadSelected().nativeElement.disabled = checked === 0;
-  }
-
-  doneSelectionChanged(checked: number) {
-    this.doneDelSelected().nativeElement.disabled = checked === 0;
-    this.doneDownloadSelected().nativeElement.disabled = checked === 0;
-  }
-
-  private updateDoneActionButtons() {
-    let completed = 0;
-    let failed = 0;
-    this.downloads.done.forEach((download) => {
-      const isFailed = download.status === 'error';
-      const isCompleted = !isFailed && (
-        download.status === 'finished' ||
-        download.status === 'completed' ||
-        Boolean(download.filename)
-      );
-      if (isCompleted) {
-        completed++;
-      } else if (isFailed) {
-        failed++;
-      }
-    });
-    this.hasCompletedDone = completed > 0;
-    this.hasFailedDone = failed > 0;
-  }
-
+  // Each choice list is the catalog's: the selected type's formats and codecs,
+  // and the selected format's qualities (empty when it has none to pick).
   setQualities() {
-    if (this.downloadType === 'video') {
-      this.qualities = this.format === 'ios'
-        ? [{ id: 'best', text: 'Best' }]
-        : VIDEO_QUALITIES;
-    } else if (this.downloadType === 'audio') {
-      const selectedFormat = this.audioFormats.find(el => el.id === this.format);
-      this.qualities = selectedFormat ? selectedFormat.qualities : [{ id: 'best', text: 'Best' }];
-    } else {
-      this.qualities = [{ id: 'best', text: 'Best' }];
+    const choice = this.selectedFormat()?.quality;
+    this.qualities = choice?.options ?? [];
+    if (choice) {
+      this.quality = this.pick(choice, this.quality);
     }
-    const exists = this.qualities.find(el => el.id === this.quality);
-    this.quality = exists ? this.quality : 'best';
   }
 
   refreshFormatOptions() {
-    if (this.downloadType === 'video') {
-      this.formatOptions = this.videoFormats;
+    const type = this.typeEntry(this.downloadType);
+    this.formatOptions = type?.format.options ?? [];
+    this.codecOptions = type?.codec?.options ?? [];
+  }
+
+  currentType(): DownloadTypeOption | undefined {
+    return this.typeEntry(this.downloadType);
+  }
+
+  hasSubtitleSettings(): boolean {
+    const type = this.currentType();
+    return !!(type?.subtitle_mode || type?.subtitle_language);
+  }
+
+  // Four fields per row are too tight at ~768px for the longer values, so a
+  // four-field type goes 2×2 from md to lg and one row from lg up.
+  optionColumnClass(): string {
+    const type = this.currentType();
+    if (!type) {
+      return 'col-md-6';
+    }
+    const fields = 2
+      + (type.codec ? 1 : 0)
+      + (this.qualities.length ? 1 : 0)
+      + (type.audio_tags ? 1 : 0)
+      + (type.subtitle_language ? 1 : 0)
+      + (type.subtitle_mode ? 1 : 0);
+    if (fields >= 4) {
+      return 'col-12 col-md-6 col-lg-3';
+    }
+    return fields === 3 ? 'col-12 col-md-4' : 'col-md-6';
+  }
+
+  // A list with a single entry is shown, but there is nothing to pick.
+  hasQualityChoice(): boolean {
+    return this.qualities.length > 1;
+  }
+
+  hasFormatChoice(): boolean {
+    return this.formatOptions.length > 1;
+  }
+
+  private typeEntry(type: string): DownloadTypeOption | undefined {
+    return this.downloadTypes.find(t => t.id === type);
+  }
+
+  private selectedFormat(): FormatOption | undefined {
+    return this.typeEntry(this.downloadType)?.format.options.find(f => f.id === this.format);
+  }
+
+  // The remembered value if the choice still offers it, else the default.
+  private pick(choice: Choice, value: string): string {
+    return choice.options.some(o => o.id === value) ? value : choice.default;
+  }
+
+  // Runs whenever the server sends its catalog (on every connect). A changed
+  // catalog, e.g. after a server upgrade, re-checks every remembered choice.
+  private applyCatalog(catalog: FormatCatalog) {
+    if (this.catalog && JSON.stringify(this.catalog) === JSON.stringify(catalog)) {
       return;
     }
-    if (this.downloadType === 'audio') {
-      this.formatOptions = this.audioFormats;
+    this.catalog = catalog;
+    this.downloadTypes = catalog.download_type.options;
+    const audio = this.downloadTypes.find(t => t.audio_tags);
+    const captions = this.downloadTypes.find(t => t.subtitle_mode || t.subtitle_language);
+    this.audioTagsOptions = audio?.audio_tags?.options ?? [];
+    this.subtitleLanguages = captions?.subtitle_language?.options ?? [];
+    this.subtitleModes = captions?.subtitle_mode?.options ?? [];
+
+    this.downloadType = this.pick(catalog.download_type, this.downloadType);
+    this.loadSavedSelections();
+    this.restoreSelection(this.downloadType);
+    this.normalizeSelectionsForType();
+    this.setQualities();
+    this.refreshFormatOptions();
+    this.previousDownloadType = this.downloadType;
+    this.saveSelection(this.downloadType);
+  }
+
+  // Brings the form's values in line with what the catalog offers for the
+  // selected type. Fields a type doesn't have are left as they are; the
+  // server ignores them for that type.
+  private normalizeSelectionsForType() {
+    const type = this.typeEntry(this.downloadType);
+    if (!type) {
       return;
     }
-    if (this.downloadType === 'captions') {
-      this.formatOptions = this.captionFormats;
-      return;
+    this.format = this.pick(type.format, this.format);
+    if (type.codec) {
+      this.codec = this.pick(type.codec, this.codec);
     }
-    this.formatOptions = this.thumbnailFormats;
-  }
-
-  showCodecSelector() {
-    return this.downloadType === 'video';
-  }
-
-  showFormatSelector() {
-    return this.downloadType !== 'thumbnail';
-  }
-
-  showQualitySelector() {
-    if (this.downloadType === 'video') {
-      return this.format !== 'ios';
+    // Audio tags and the subtitle settings are kept across types, so they are
+    // checked against the types that define them.
+    const audio = this.downloadTypes.find(t => t.audio_tags);
+    if (audio?.audio_tags) {
+      this.audioTags = this.pick(audio.audio_tags, this.audioTags);
     }
-    return this.downloadType === 'audio';
-  }
-
-  private normalizeSelectionsForType(resetForTypeChange = false) {
-    if (this.downloadType === 'video') {
-      const allowedFormats = new Set(this.videoFormats.map(f => f.id));
-      if (resetForTypeChange || !allowedFormats.has(this.format)) {
-        this.format = 'any';
-      }
-      const allowedCodecs = new Set(this.videoCodecs.map(c => c.id));
-      if (resetForTypeChange || !allowedCodecs.has(this.codec)) {
-        this.codec = 'auto';
-      }
-    } else if (this.downloadType === 'audio') {
-      const allowedFormats = new Set(this.audioFormats.map(f => f.id));
-      if (resetForTypeChange || !allowedFormats.has(this.format)) {
-        this.format = this.audioFormats[0].id;
-      }
-    } else if (this.downloadType === 'captions') {
-      const allowedFormats = new Set(this.captionFormats.map(f => f.id));
-      if (resetForTypeChange || !allowedFormats.has(this.format)) {
-        this.format = 'srt';
-      }
-      this.quality = 'best';
-    } else {
-      this.format = 'jpg';
-      this.quality = 'best';
+    const captions = this.downloadTypes.find(t => t.subtitle_mode || t.subtitle_language);
+    if (captions?.subtitle_mode) {
+      this.subtitleMode = this.pick(captions.subtitle_mode, this.subtitleMode);
     }
-    this.cookieService.set('metube_format', this.format, { expires: this.settingsCookieExpiryDays });
-    this.cookieService.set('metube_codec', this.codec, { expires: this.settingsCookieExpiryDays });
+    if (captions?.subtitle_language && !this.subtitleLanguage?.trim()) {
+      // Any language tag is accepted; only an empty one takes the default.
+      this.subtitleLanguage = captions.subtitle_language.default;
+    }
+    this.settings.set('metube_format', this.format);
+    this.settings.set('metube_codec', this.codec);
   }
 
   private saveSelection(type: string) {
@@ -1112,11 +708,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
       subtitleMode: this.subtitleMode,
     };
     this.selectionsByType[type] = selection;
-    this.cookieService.set(
-      this.selectionCookiePrefix + type,
-      JSON.stringify(selection),
-      { expires: this.settingsCookieExpiryDays }
-    );
+    this.settings.set(this.selectionKeyPrefix + type, JSON.stringify(selection));
   }
 
   private restoreSelection(type: string) {
@@ -1131,22 +723,22 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
 
   private loadSavedSelections() {
     for (const type of this.downloadTypes.map(t => t.id)) {
-      const key = this.selectionCookiePrefix + type;
-      if (!this.cookieService.check(key)) continue;
+      const key = this.selectionKeyPrefix + type;
+      if (!this.settings.has(key)) continue;
       try {
-        const raw = this.cookieService.get(key);
+        const raw = this.settings.get(key);
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === 'object') {
           this.selectionsByType[type] = {
-            codec: String(parsed.codec ?? 'auto'),
+            codec: String(parsed.codec ?? ''),
             format: String(parsed.format ?? ''),
-            quality: String(parsed.quality ?? 'best'),
-            subtitleLanguage: String(parsed.subtitleLanguage ?? 'en'),
-            subtitleMode: String(parsed.subtitleMode ?? 'prefer_manual'),
+            quality: String(parsed.quality ?? ''),
+            subtitleLanguage: String(parsed.subtitleLanguage ?? ''),
+            subtitleMode: String(parsed.subtitleMode ?? ''),
           };
         }
       } catch {
-        // Ignore malformed cookie values.
+        // Ignore malformed stored values.
       }
     }
   }
@@ -1165,6 +757,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
       autoStart: overrides.autoStart ?? this.autoStart,
       splitByChapters: overrides.splitByChapters ?? this.splitByChapters,
       sponsorblock: overrides.sponsorblock ?? this.sponsorblock,
+      audioTags: overrides.audioTags ?? this.audioTags,
       chapterTemplate: overrides.chapterTemplate ?? this.chapterTemplate,
       subtitleLanguage: overrides.subtitleLanguage ?? this.subtitleLanguage,
       subtitleMode: overrides.subtitleMode ?? this.subtitleMode,
@@ -1174,18 +767,13 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
         : '',
       clipStart: overrides.clipStart ?? this.clipStart,
       clipEnd: overrides.clipEnd ?? this.clipEnd,
+      videoPassword: overrides.videoPassword ?? this.videoPassword,
     };
   }
 
   addDownload(overrides: Partial<AddDownloadPayload> = {}) {
     const payload = this.buildAddPayload(overrides);
-
-    // Validate chapter template if chapter splitting is enabled
-    if (payload.splitByChapters && !payload.chapterTemplate.includes('%(section_number)')) {
-      this.toasts.error('Chapter template must include %(section_number)');
-      return;
-    }
-    if (!this.validateYtdlOptionsOverrides(payload.ytdlOptionsOverrides)) {
+    if (!this.validateAddSettings(payload)) {
       return;
     }
 
@@ -1201,9 +789,78 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
           this.toasts.info(status.msg);
         }
         this.addUrl = '';
+        this.videoPassword = '';
       }
       this.resetAddState();
     });
+  }
+
+  // Settings checks shared by every path that queues downloads from the form.
+  private validateAddSettings(payload: AddDownloadPayload): boolean {
+    // Validate chapter template if chapter splitting is enabled
+    if (payload.splitByChapters && !payload.chapterTemplate.includes('%(section_number)')) {
+      this.toasts.error('Chapter template must include %(section_number)');
+      return false;
+    }
+    return this.validateYtdlOptionsOverrides(payload.ytdlOptionsOverrides);
+  }
+
+  // Probe a playlist or channel URL and let the user pick which entries to
+  // queue. The picked entries are added as single downloads with the form's
+  // current settings.
+  browsePlaylist() {
+    const url = (this.addUrl ?? '').trim();
+    if (!url) {
+      return;
+    }
+    const template = this.buildAddPayload({ url });
+    if (!this.validateAddSettings(template)) {
+      return;
+    }
+    const ref = this.modal.open(PlaylistBrowserComponent, { size: 'lg', scrollable: true });
+    ref.componentInstance.payload = {
+      url,
+      playlistItemLimit: template.playlistItemLimit,
+      ytdlOptionsPresets: template.ytdlOptionsPresets,
+      ytdlOptionsOverrides: template.ytdlOptionsOverrides,
+    };
+    ref.result.then(
+      (urls: string[]) => this.queueBrowsedEntries(urls),
+      () => { /* dismissed */ },
+    );
+  }
+
+  private queueBrowsedEntries(urls: string[]) {
+    if (!urls?.length) {
+      return;
+    }
+    let queued = 0;
+    let failed = 0;
+    let firstError = '';
+    from(urls).pipe(
+      mergeMap(
+        url => this.downloads.add(this.buildAddPayload({ url })).pipe(
+          tap((status: Status) => {
+            if (status.status === 'error') {
+              failed++;
+              firstError ||= status.msg || 'Unknown error';
+            } else {
+              queued++;
+            }
+          }),
+        ),
+        ADD_REQUEST_CONCURRENCY,
+      ),
+      takeUntilDestroyed(this.destroyRef),
+      finalize(() => {
+        if (failed > 0) {
+          this.toasts.error(`Queued ${queued} of ${urls.length}; ${failed} failed: ${firstError}`);
+        } else if (queued > 0) {
+          this.toasts.info(`Queued ${queued} ${queued === 1 ? 'item' : 'items'}`);
+        }
+        this.cdr.markForCheck();
+      }),
+    ).subscribe();
   }
 
   cancelAdding() {
@@ -1227,285 +884,23 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     this.cdr.markForCheck();
   }
 
-  downloadItemByKey(id: string) {
-    this.downloads.startById([id]).subscribe((res) => this.handleActionResult(res, 'Start download failed'));
-  }
-
-  // 'preparing' (yt-dlp starting up) and 'postprocessing' (ffmpeg merging,
-  // re-encoding or splitting once the bytes have landed) both have real work in
-  // flight with no percentage to report, so the bar runs animated at full width
-  // instead of showing a number that cannot move.
-  isIndeterminate(download: Download): boolean {
-    return download.status === 'preparing' || download.status === 'postprocessing';
-  }
-
-  liveCountdownSeconds(download: Download): number | null {
-    const ts = download.live_release_timestamp;
-    if (ts == null || download.status !== 'scheduled') {
-      return null;
-    }
-    return Math.max(0, ts - Date.now() / 1000);
-  }
-
-  private syncLiveCountdownTimer() {
-    const hasScheduled = Array.from(this.downloads.queue.values()).some(
-      (download) => download.status === 'scheduled',
-    );
-    if (hasScheduled && !this.liveCountdownTimer) {
-      this.liveCountdownTimer = setInterval(() => this.cdr.markForCheck(), 1000);
-    } else if (!hasScheduled && this.liveCountdownTimer) {
-      clearInterval(this.liveCountdownTimer);
-      this.liveCountdownTimer = undefined;
-    }
-  }
-
-  retryDownload(key: string, download: Download) {
-    // Only remove the done-list record once the retry is confirmed queued —
-    // deleting it eagerly would silently lose history if the re-add fails.
-    this.downloads.retry(key)
-      .pipe(takeUntilDestroyed(this.destroyRef))
-      .subscribe((status: Status) => {
-        if (status.status === 'error') {
-          this.toasts.error(`Error retrying ${download.title}: ${status.msg}`);
-          this.cdr.markForCheck();
-          return;
-        }
-        this.downloads.delById('done', [key]).subscribe();
-      });
-  }
-
-  delDownload(where: State, id: string) {
-    this.downloads.delById(where, [id]).subscribe((res) => this.handleActionResult(res, 'Delete failed'));
-  }
-
-  startSelectedDownloads(where: State){
-    this.downloads.startByFilter(where, dl => !!dl.checked).subscribe((res) => this.handleActionResult(res, 'Start download failed'));
-  }
-
-  delSelectedDownloads(where: State) {
-    this.downloads.delByFilter(where, dl => !!dl.checked).subscribe((res) => this.handleActionResult(res, 'Delete failed'));
-  }
-
-  clearCompletedDownloads() {
-    this.downloads.delByFilter('done', dl => dl.status === 'finished').subscribe((res) => this.handleActionResult(res, 'Clear completed failed'));
-  }
-
-  clearFailedDownloads() {
-    this.downloads.delByFilter('done', dl => dl.status === 'error').subscribe((res) => this.handleActionResult(res, 'Clear failed downloads failed'));
-  }
-
-  retryFailedDownloads() {
-    this.downloads.done.forEach((dl, key) => {
-      if (dl.status === 'error') {
-        this.retryDownload(key, dl);
-      }
-    });
-  }
-
-  // Chromium-based browsers silently drop programmatic downloads beyond ~10 when
-  // triggered in a tight loop. Trigger in batches with a short pause in between so
-  // large selections download cleanly. See issue #1008.
-  private static readonly DOWNLOAD_BATCH_SIZE = 10;
-  private static readonly DOWNLOAD_BATCH_DELAY_MS = 1000;
-
-  async downloadSelectedFiles() {
-    const selected: Download[] = [];
-    this.downloads.done.forEach((dl) => {
-      if (dl.status === 'finished' && dl.checked) {
-        selected.push(dl);
-      }
-    });
-
-    for (let i = 0; i < selected.length; i++) {
-      const dl = selected[i];
-      const link = document.createElement('a');
-      link.href = this.buildDownloadLink(dl);
-      link.setAttribute('download', dl.filename);
-      link.setAttribute('target', '_self');
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-
-      if (
-        (i + 1) % App.DOWNLOAD_BATCH_SIZE === 0 &&
-        i + 1 < selected.length
-      ) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, App.DOWNLOAD_BATCH_DELAY_MS),
-        );
-      }
-    }
-  }
-
-  buildDownloadLink(download: Download) {
-    let baseDir = this.downloads.configuration["PUBLIC_HOST_URL"];
-    // Must match the server's directory rule exactly: ytdl.py writes to
-    // AUDIO_DOWNLOAD_DIR on download_type alone. Treating any .mp3 as audio
-    // sent the link to audio_download/ for mp3s produced under a video-type
-    // download (a postprocessor, a preset, or a legacy record), which the
-    // server had written to DOWNLOAD_DIR -- a 404 whenever the two differ.
-    if (download.download_type === 'audio') {
-      baseDir = this.downloads.configuration["PUBLIC_HOST_AUDIO_URL"];
-    }
-
-    if (download.folder) {
-      baseDir += this.encodeFolderPath(download.folder);
-    }
-
-    return baseDir + encodeURIComponent(download.filename);
-  }
-
-  // Web Share API support — primarily for iOS Safari / Chrome, lets the user
-  // hand the downloaded file off to the platform share sheet (Photos.app,
-  // Files, third-party apps, AirDrop). Falls back silently to the standard
-  // download flow on platforms without navigator.share / canShare.
-  canShareDownloads(): boolean {
-    // navigator.share alone is not enough — Desktop Safari implements
-    // navigator.share but not canShare with files. We explicitly require
-    // both, since we always intend to share a file (not a URL).
-    return typeof navigator !== 'undefined'
-      && typeof navigator.share === 'function'
-      && typeof navigator.canShare === 'function';
-  }
-
-  // Conservative warning threshold for the share sheet — iOS' actual
-  // refusal limit varies between ~50 MB (older versions) and ~150 MB
-  // (recent ones). 80 MB warns the user before the time-wasting fetch+
-  // copy of a too-large file that the platform will then reject.
-  private static readonly SHARE_SIZE_WARN_BYTES = 80 * 1024 * 1024;
-
-  async shareDownload(download: Download): Promise<void> {
-    if (!this.canShareDownloads()) {
+  // Keeps the non-negative integer fields to digits. Only a typed character
+  // is filtered: named keys (Enter, Tab, arrows, Escape, F-keys) and anything
+  // with a modifier pass, so Enter submits and Ctrl/Cmd+A/C/V/X/Z still work.
+  // An allowlist of named keys used to block all of those.
+  digitsOnly(event: KeyboardEvent) {
+    if (event.ctrlKey || event.metaKey || event.altKey || event.key.length !== 1) {
       return;
     }
-    // Pre-flight size check: warn the user about the iOS share-sheet
-    // soft-fail on large files, before we spend time fetching the whole
-    // file into memory only to have navigator.canShare reject it.
-    if (download.size && download.size > App.SHARE_SIZE_WARN_BYTES) {
-      const sizeMb = Math.round(download.size / 1024 / 1024);
-      const proceed = await this.toasts.confirm(
-        `This file is ${sizeMb} MB. iOS' share sheet often refuses files ` +
-        `larger than ~100 MB and the share will silently fail. ` +
-        `Try anyway? (Use the download button instead if it fails.)`,
-        'Try anyway',
-        'Cancel',
-      );
-      if (!proceed) return;
-    }
-    try {
-      const response = await fetch(this.buildDownloadLink(download));
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status} fetching file for share`);
-      }
-      const blob = await response.blob();
-      const file = new File([blob], download.filename, {
-        type: blob.type || 'application/octet-stream',
-      });
-      const payload: ShareData = { files: [file], title: download.title };
-      if (!navigator.canShare(payload)) {
-        // The platform refused the payload — most commonly because the
-        // file is too large for the iOS share sheet, or the MIME type
-        // isn't accepted. Tell the user so they can fall back to the
-        // download button right next to this one instead of staring at
-        // a button that quietly did nothing.
-        console.warn('navigator.canShare rejected payload for', download.filename);
-        this.toasts.error(
-          `Your device's share sheet doesn't accept this file ` +
-          `(most likely because it's too large). ` +
-          `Please use the download button instead.`
-        );
-        return;
-      }
-      await navigator.share(payload);
-    } catch (err) {
-      const e = err as { name?: string; message?: string };
-      // AbortError = user dismissed the share sheet → silent no-op.
-      if (e.name === 'AbortError') return;
-      console.error('Share failed:', err);
-      this.toasts.error(
-        `Share failed: ${e.message || 'unknown error'}. ` +
-        `Please use the download button instead.`
-      );
-    }
-  }
-
-  buildResultItemTooltip(download: Download) {
-    const parts = [];
-    if (download.msg) {
-      parts.push(download.msg);
-    }
-    if (download.error) {
-      parts.push(download.error);
-    }
-    return parts.join(' | ');
-  }
-
-  buildChapterDownloadLink(download: Download, chapterFilename: string) {
-    let baseDir = this.downloads.configuration["PUBLIC_HOST_URL"];
-    // Same server-side rule as buildDownloadLink above.
-    if (download.download_type === 'audio') {
-      baseDir = this.downloads.configuration["PUBLIC_HOST_AUDIO_URL"];
-    }
-
-    if (download.folder) {
-      baseDir += this.encodeFolderPath(download.folder);
-    }
-
-    return baseDir + encodeURIComponent(chapterFilename);
-  }
-
-  private encodeFolderPath(folder: string): string {
-    return folder
-      .split('/')
-      .filter(segment => segment.length > 0)
-      .map(segment => encodeURIComponent(segment))
-      .join('/') + '/';
-  }
-
-  getChapterFileName(filepath: string) {
-    // Extract just the filename from the path
-    const parts = filepath.split('/');
-    return parts[parts.length - 1];
-  }
-
-  isNumber(event: KeyboardEvent) {
-    const allowedControlKeys = ['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'Tab', 'Home', 'End'];
-    if (allowedControlKeys.includes(event.key)) {
-      return;
-    }
-
     if (!/^[0-9]$/.test(event.key)) {
       event.preventDefault();
     }
   }
 
-  // Toggle inline batch panel (if you want to use an inline panel for export; not used for import modal)
-  toggleBatchPanel(): void {
-    this.showBatchPanel = !this.showBatchPanel;
-  }
-
-  // Open the Batch Import modal
+  // Open the Batch Import modal; each URL is queued with the form's settings.
   openBatchImportModal(): void {
-    this.lastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    this.batchImportModalOpen = true;
-    this.batchImportText = '';
-    this.batchImportStatus = '';
-    this.batchImportCount = 0;
-    this.batchImportTotal = 0;
-    this.batchImportFailures = 0;
-    this.importInProgress = false;
-    setTimeout(() => {
-      const textarea = document.getElementById('batch-import-textarea');
-      if (textarea instanceof HTMLTextAreaElement) {
-        textarea.focus();
-      }
-    }, 0);
-  }
-
-  // Close the Batch Import modal
-  closeBatchImportModal(): void {
-    this.batchImportModalOpen = false;
-    this.lastFocusedElement?.focus();
+    const ref = this.modal.open(BatchImportComponent);
+    ref.componentInstance.buildPayload = (url: string) => this.buildAddPayload({ url });
   }
 
   private startApp(): void {
@@ -1608,11 +1003,11 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   }
 
   loadSettings(): void {
-    this.settings = null;
+    this.serverSettings = null;
     this.settingsError = '';
     this.downloads.getSettings().subscribe((res) => {
       if (res && 'direct_routes' in res) {
-        this.settings = res;
+        this.serverSettings = res;
       } else {
         this.settingsError = `Could not load settings: ${this.formatErrorMessage((res as { msg?: unknown })?.msg)}`;
       }
@@ -1631,7 +1026,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     for (const [name, value] of Object.entries(params)) {
       if (value) query.set(name, value);
     }
-    if (this.settings?.direct_routes_key) query.set('key', this.settings.direct_routes_key);
+    if (this.serverSettings?.direct_routes_key) query.set('key', this.serverSettings.direct_routes_key);
     const text = query.toString();
     return text ? `?${text}` : '';
   }
@@ -1703,24 +1098,24 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   }
 
   generateDirectRoutesKey(): void {
-    if (!this.settings) return;
+    if (!this.serverSettings) return;
     const bytes = new Uint8Array(24);
     crypto.getRandomValues(bytes);
-    this.settings.direct_routes_key = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    this.serverSettings.direct_routes_key = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
   }
 
   saveSettings(): void {
-    if (!this.settings) return;
+    if (!this.serverSettings) return;
     // Fields locked by an environment variable are not sent; the server would refuse them.
     const changes: ServerSettingsChanges = {};
-    if (!this.settings.locked.direct_routes) changes.direct_routes = this.settings.direct_routes;
-    if (!this.settings.locked.direct_routes_key) changes.direct_routes_key = this.settings.direct_routes_key;
+    if (!this.serverSettings.locked.direct_routes) changes.direct_routes = this.serverSettings.direct_routes;
+    if (!this.serverSettings.locked.direct_routes_key) changes.direct_routes_key = this.serverSettings.direct_routes_key;
     this.settingsSaving = true;
     this.settingsError = '';
     this.downloads.saveSettings(changes).subscribe((res) => {
       this.settingsSaving = false;
       if (res && 'direct_routes' in res) {
-        this.settings = res;
+        this.serverSettings = res;
         this.toasts.success('Settings saved.');
       } else {
         this.settingsError = `Could not save settings: ${this.formatErrorMessage((res as { msg?: unknown })?.msg)}`;
@@ -1729,76 +1124,6 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     });
   }
 
-  // Start importing URLs from the batch modal textarea
-  startBatchImport(): void {
-    const urls = this.batchImportText
-      .split(/\r?\n/)
-      .map(url => url.trim())
-      .filter(url => url.length > 0);
-    if (urls.length === 0) {
-      this.toasts.error('No valid URLs found.');
-      return;
-    }
-    this.importInProgress = true;
-    this.batchImportCount = 0;
-    this.batchImportFailures = 0;
-    this.batchImportTotal = urls.length;
-    this.updateBatchImportStatus();
-
-    from(urls).pipe(
-      mergeMap(
-        url => this.downloads.add(this.buildAddPayload({ url })).pipe(
-          // downloads.add() already catches HTTP errors and emits a single
-          // Status value, so `tap` (not `finalize`) is the right place to
-          // count. This avoids incrementing the counter when an in-flight
-          // request is aborted by cancellation.
-          tap((status: Status) => {
-            if (status.status === 'error') {
-              this.batchImportFailures++;
-              console.error(`Error adding URL ${url}: ${status.msg}`);
-            }
-            this.batchImportCount++;
-            this.updateBatchImportStatus();
-            this.cdr.markForCheck();
-          }),
-        ),
-        App.BATCH_IMPORT_CONCURRENCY,
-      ),
-      takeUntil(this.batchImportCancel$),
-      takeUntilDestroyed(this.destroyRef),
-      finalize(() => {
-        this.importInProgress = false;
-        this.updateBatchImportStatus(true);
-        this.cdr.markForCheck();
-      }),
-    ).subscribe();
-  }
-
-  private updateBatchImportStatus(done = false): void {
-    const parts: string[] = [];
-    if (done) {
-      const processed = this.batchImportCount;
-      if (processed < this.batchImportTotal) {
-        parts.push(`Import cancelled after ${processed} of ${this.batchImportTotal} URLs.`);
-      } else {
-        parts.push(`Finished importing ${this.batchImportTotal} URLs.`);
-      }
-    } else {
-      parts.push(`Importing ${this.batchImportCount} of ${this.batchImportTotal} URLs...`);
-    }
-    if (this.batchImportFailures > 0) {
-      parts.push(`${this.batchImportFailures} failed.`);
-    }
-    this.batchImportStatus = parts.join(' ');
-  }
-
-  // Cancel the batch import process: aborts in-flight and pending requests
-  // immediately via the cancellation Subject wired into the pipeline.
-  cancelBatchImport(): void {
-    if (this.importInProgress) {
-      this.batchImportCancel$.next();
-    }
-  }
 
   // Export URLs based on filter: 'pending', 'completed', 'failed', or 'all'
   exportBatchUrls(filter: BatchUrlFilter): void {
@@ -1811,18 +1136,18 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   }
 
   fetchVersionInfo(): void {
-    // eslint-disable-next-line no-useless-escape
-    const baseUrl = `${window.location.origin}${window.location.pathname.replace(/\/[^\/]*$/, '/')}`;
-    const versionUrl = `${baseUrl}version`;
-    this.http.get<{ 'yt-dlp': string, version: string }>(versionUrl)
+    // Relative, like every other API call, so it follows URL_PREFIX.
+    this.http.get<{ 'yt-dlp': string, version: string }>('version')
       .subscribe({
         next: (data) => {
           this.ytDlpVersion = data['yt-dlp'];
           this.metubeVersion = data.version;
+          this.cdr.markForCheck();
         },
         error: () => {
           this.ytDlpVersion = null;
           this.metubeVersion = null;
+          this.cdr.markForCheck();
         }
       });
   }
@@ -1831,88 +1156,11 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     this.isAdvancedOpen = !this.isAdvancedOpen;
   }
 
-  toggleSortOrder() {
-    this.sortAscending = !this.sortAscending;
-    this.cookieService.set('metube_sort_ascending', this.sortAscending ? 'true' : 'false', { expires: this.settingsCookieExpiryDays });
-    this.rebuildSortedDone();
-  }
-
-  toggleDownloadingCollapsed() {
-    this.downloadingCollapsed = !this.downloadingCollapsed;
-    this.cookieService.set('metube_downloading_collapsed', this.downloadingCollapsed ? 'true' : 'false', { expires: this.settingsCookieExpiryDays });
-  }
-
-  toggleCompletedCollapsed() {
-    this.completedCollapsed = !this.completedCollapsed;
-    this.cookieService.set('metube_completed_collapsed', this.completedCollapsed ? 'true' : 'false', { expires: this.settingsCookieExpiryDays });
-  }
-
-  toggleSubscriptionsCollapsed() {
-    this.subscriptionsCollapsed = !this.subscriptionsCollapsed;
-    this.cookieService.set('metube_subscriptions_collapsed', this.subscriptionsCollapsed ? 'true' : 'false', { expires: this.settingsCookieExpiryDays });
-  }
-
-  private rebuildSortedDone() {
-    const result: [string, Download][] = [];
-    this.downloads.done.forEach((dl, key) => {
-      result.push([key, dl]);
-    });
-    if (!this.sortAscending) {
-      result.reverse();
-    }
-    this.cachedSortedDone = result;
-    this.cachedSortedDoneIds = result.map(([key]) => key);
-  }
-
-  toggleErrorDetail(id: string) {
-    if (this.expandedErrors.has(id)) this.expandedErrors.delete(id);
-    else this.expandedErrors.add(id);
-  }
-
-  copyErrorMessage(id: string, download: Download) {
-    const parts: string[] = [];
-    if (download.title) parts.push(`Title: ${download.title}`);
-    if (download.url) parts.push(`URL: ${download.url}`);
-    if (download.msg) parts.push(`Message: ${download.msg}`);
-    if (download.error) parts.push(`Error: ${download.error}`);
-    const text = parts.join('\n');
-    if (!text.trim()) return;
-    const done = () => {
-      this.lastCopiedErrorId = id;
-      setTimeout(() => { this.lastCopiedErrorId = null; }, 1500);
-    };
-    const fail = (err?: unknown) => {
-      console.error('Clipboard write failed:', err);
-      this.toasts.error('Failed to copy to clipboard. Your browser may require HTTPS for clipboard access.');
-    };
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).then(done).catch(fail);
-    } else {
-      try {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.setAttribute('readonly', '');
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        done();
-      } catch (e) {
-        fail(e);
-      }
-    }
-  }
-
-  isErrorExpanded(id: string): boolean {
-    return this.expandedErrors.has(id);
-  }
-
   onCookieFileSelect(event: Event) {
     const input = event.target as HTMLInputElement;
     if (!input.files?.length) return;
     this.cookieUploadInProgress = true;
+    this.cdr.markForCheck();
     this.downloads.uploadCookies(input.files[0]).subscribe({
       next: (response) => {
         if (response?.status === 'ok') {
@@ -1923,12 +1171,14 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
         }
         this.cookieUploadInProgress = false;
         input.value = '';
+        this.cdr.markForCheck();
       },
       error: () => {
         this.refreshCookieStatus();
         this.cookieUploadInProgress = false;
         input.value = '';
         this.toasts.error('Error uploading cookies.');
+        this.cdr.markForCheck();
       }
     });
   }
@@ -1974,6 +1224,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   private refreshCookieStatus() {
     this.downloads.getCookieStatus().subscribe(data => {
       this.hasCookies = !!(data && typeof data === 'object' && 'has_cookies' in data && data.has_cookies);
+      this.cdr.markForCheck();
     });
   }
 
@@ -1990,7 +1241,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
         speed += download.speed || 0;
       } else if (download.status === 'preparing' || download.status === 'postprocessing') {
         active++;
-      } else if (download.status === 'pending' || download.status === 'scheduled') {
+      } else if (download.status === 'queued' || download.status === 'pending' || download.status === 'scheduled') {
         queued++;
       }
     });
